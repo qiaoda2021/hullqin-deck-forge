@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>控牌助手 · 界面预览</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(120% 90% at 50% 0%, #1d3a2f 0%, #14251f 45%, #0b1216 100%);
+    color: #cfd7e5; overflow: hidden;
+  }
+  .felt {
+    position: fixed; inset: 0; display: grid; place-items: center;
+  }
+  .table {
+    width: min(78vw, 900px); aspect-ratio: 16 / 10; border-radius: 50% / 42%;
+    background: radial-gradient(80% 80% at 50% 40%, #2a5c47, #1b3b2f 60%, #12261f 100%);
+    box-shadow: inset 0 0 80px rgba(0,0,0,.55), 0 30px 80px -30px #000;
+    border: 10px solid #2c2118; position: relative;
+  }
+  .seat {
+    position: absolute; width: 92px; padding: 6px 0; text-align: center; border-radius: 10px;
+    background: rgba(0,0,0,.28); border: 1px solid rgba(255,255,255,.08); font-size: 12px; color: #b8c4d4;
+  }
+  .seat b { display: block; color: #fff; font-size: 12.5px; }
+  .seat.me { border-color: rgba(110,231,160,.5); color: #6ee7a0; }
+  .s1 { left: 50%; bottom: 4%; transform: translateX(-50%); }
+  .s2 { left: 3%; top: 50%; transform: translateY(-50%); }
+  .s3 { left: 50%; top: 4%; transform: translateX(-50%); }
+  .s4 { right: 3%; top: 50%; transform: translateY(-50%); }
+  .hand {
+    position: absolute; left: 50%; bottom: 13%; transform: translateX(-50%);
+    display: flex; gap: 2px;
+  }
+  .card {
+    width: 34px; height: 48px; border-radius: 5px; background: linear-gradient(160deg, #fdfefe, #dfe7f1);
+    color: #16202c; font-size: 12px; font-weight: 700; display: flex; align-items: flex-start;
+    justify-content: center; padding-top: 3px; box-shadow: 0 2px 6px rgba(0,0,0,.45);
+  }
+  .card.red { color: #d33; }
+  .tips {
+    position: fixed; left: 16px; top: 16px; width: 268px; padding: 12px 14px; border-radius: 12px;
+    background: rgba(10,14,20,.82); border: 1px solid rgba(255,255,255,.09); font-size: 12px; line-height: 1.65;
+    backdrop-filter: blur(10px);
+  }
+  .tips h1 { margin: 0 0 6px; font-size: 13px; color: #f0cf8c; letter-spacing: .5px; }
+  .tips b { color: #fff; font-weight: 600; }
+  .tips code { background: rgba(255,255,255,.08); padding: 0 4px; border-radius: 4px; font-size: 11px; }
+  .tips .k { color: #6ee7a0; }
+  .tips button {
+    all: unset; cursor: pointer; display: inline-block; margin-top: 8px; padding: 5px 10px; border-radius: 7px;
+    background: rgba(232,193,118,.16); border: 1px solid rgba(232,193,118,.4); color: #f0cf8c; font-size: 11.5px;
+  }
+  .tips button:hover { background: rgba(232,193,118,.26); }
+  .note { color: #7f8a9e; font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="felt">
+  <div class="table" id="table">
+    <div class="seat s3"><b id="p3">P3</b>17 张</div>
+    <div class="seat s2"><b id="p2">P2</b>17 张</div>
+    <div class="seat s4"><b id="p4">P4</b>17 张</div>
+    <div class="seat s1 me"><b id="p1">我</b>17 张</div>
+    <div class="hand" id="hand"></div>
+  </div>
+</div>
+
+<div class="tips">
+  <h1>控牌助手 · 界面预览</h1>
+  这是用假牌局驱动的真面板：右边那个就是插件的样子。
+  <div class="note">
+    · 点格子选牌（左键 +1 副本，右键 −1），或点「快捷目标」<br>
+    · 选完点 <b>存为预设</b> → 以后每局发牌就是这套牌<br>
+    · <b>换牌</b> = 走页面 <code>PlayerUpdateGameData</code> 通道<br>
+    · 面板里还有 <b>🤖 AI 建议</b>、<b>🃏 记牌器</b>、<b>👁 四家透视</b><br>
+    · <span class="k">Alt+D</span> 收起/展开面板
+  </div>
+  <button id="redeal">换一局牌</button>
+</div>
+
+<!-- 规则引擎（AI 要用）→ 数据层 → AI / 记牌器 → 面板 → 控制器 -->
+<script src="../vendor/ddz.core.js"></script>
+<script src="../vendor/gd.core.js"></script>
+<script src="../vendor/gd.ai.js"></script>
+<script src="../dg.core.js"></script>
+<script src="../dg.ai.js"></script>
+<script src="../dg.recorder.js"></script>
+<script src="../dg.site.ui.js"></script>
+<script src="../dg.site.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  const SUITS = ['♦', '♣', '♥', '♠'];
+  function rankOf(id) {
+    const b = ((id - 1) % 54 + 54) % 54 + 1;
+    if (b === 53) return 17;
+    if (b === 54) return 16;
+    const r = b % 13;
+    return r === 1 ? 14 : (r === 0 ? 13 : r);
+  }
+  function suitOf(id) {
+    const b = ((id - 1) % 54 + 54) % 54 + 1;
+    return b >= 53 ? -1 : Math.floor((b - 1) / 13);
+  }
+  function cardText(id) {
+    const r = rankOf(id);
+    if (r >= 16) return r === 17 ? '大王' : '小王';
+    const rt = { 11: 'J', 12: 'Q', 13: 'K', 14: 'A' }[r] || String(r);
+    return SUITS[suitOf(id)] + rt;
+  }
+
+  let seed = 20260101;
+  function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+  function shuffle(a) {
+    for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a;
+  }
+
+  function deal() {
+    const cpl = new Array(54).fill(15);
+    const deck = shuffle(Array.from({ length: 54 }, (_, i) => i + 1));
+    let p = 0;
+    for (let s = 1; s <= 3; s++) for (let c = 0; c < 17; c++) cpl[deck[p++] - 1] = s;
+    return { rule: 0, state: 1, landlordId: 0, cardPositionList: cpl, playedCardList: [], v: 1,
+      team13Level: 0, team24Level: 0, lastRankList: [], tributeCardList: [], returnCardList: [],
+      firstPlayer: 0, playedTypeList: [] };
+  }
+
+  const props = {
+    room: {
+      position: 1, owner: 9, state: 1, version: 5,
+      playerList: [{ nickname: '我' }, { nickname: 'P2' }, { nickname: 'P3' }]
+    },
+    game: { data: DG.encodeGameData(deal()), version: 7 },
+    send: function (key, payload) {
+      if (key !== 0) return;
+      props.game = { data: payload.data, version: props.game.version + 1 };
+      paint();
+    }
+  };
+
+  // 假 fiber 查找：永远返回同一份 props
+  window.HQ = { findProps: function (el, test) { return test(props) ? props : null; } };
+
+  function paint() {
+    const raw = DG.decodeGameData(props.game.data);
+    const v = DG.expand(raw, { seats: 3 });
+    const hand = document.getElementById('hand');
+    hand.innerHTML = '';
+    DG.sortHand(v.hands[1]).forEach(function (id) {
+      const d = document.createElement('div');
+      d.className = 'card' + (rankOf(id) === 17 || suitOf(id) === 0 || suitOf(id) === 2 ? ' red' : '');
+      d.textContent = cardText(id);
+      hand.appendChild(d);
+    });
+    document.getElementById('p1').parentNode.childNodes[1].nodeValue = v.counts[1] + ' 张';
+    document.getElementById('p2').parentNode.childNodes[1].nodeValue = v.counts[2] + ' 张';
+    document.getElementById('p3').parentNode.childNodes[1].nodeValue = v.counts[3] + ' 张';
+    document.getElementById('p4').parentNode.style.display = 'none';
+  }
+
+  const ctl = DGSite.create({ DG: DG, DGUi: DGUi, DGAI: window.DGAI, DGRec: window.DGRec, HQ: window.HQ });
+  ctl.start();
+  window.HQX = ctl;
+  paint();
+
+  document.getElementById('redeal').addEventListener('click', function () {
+    seed = (seed * 7919 + 13) >>> 0;
+    props.game = { data: DG.encodeGameData(deal()), version: props.game.version + 1 };
+    ctl.getUi().setSelected([]);
+    paint();
+  });
+
+  document.getElementById('p4').parentNode.style.display = 'none';
+})();
+</script>
+</body>
+</html>
