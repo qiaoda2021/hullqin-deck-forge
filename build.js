@@ -12,10 +12,13 @@ const OUT_NAME = 'hullqin-deck-forge.user.js';
 const META = {
   name: '控牌助手（斗地主 / 掼蛋）',
   namespace: 'hullqin-deck-forge',
-  version: '2.0.0',
+  version: '2.1.0',
   author: 'Eve',
   license: 'MIT',
   match: 'https://game.hullqin.cn/*',
+  // 仓库地址：油猴靠这两行做「检查更新」，换仓库时只改这里
+  repo: 'https://github.com/qiaoda2021/hullqin-deck-forge',
+  updateURL: 'https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js',
   description:
     '斗地主 / 掼蛋 一体化牌局助手：👁 四家透视 · 🃏 记牌器 · 🤖 AI 出牌建议与托管 · 🎯 自选目标牌 · 🔁 等价交换换牌 · ' +
     '🎬 开局预设（每局发牌瞬间就变成你要的牌）。走页面自带的 PlayerUpdateGameData 通道，非房主可用；每次改动前后自动自检，' +
@@ -50,6 +53,10 @@ function header() {
   put('run-at', 'document-idle');
   put('grant', 'none');
   put('license', META.license);
+  put('homepageURL', META.repo);
+  put('supportURL', META.repo + '/issues');
+  put('downloadURL', META.updateURL);
+  put('updateURL', META.updateURL);
   lines.push('// ==/UserScript==');
   return lines.join('\n');
 }

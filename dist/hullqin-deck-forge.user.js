@@ -1,13 +1,17 @@
 // ==UserScript==
 // @name         控牌助手（斗地主 / 掼蛋）
 // @namespace    hullqin-deck-forge
-// @version      2.0.0
+// @version      2.1.0
 // @description  斗地主 / 掼蛋 一体化牌局助手：👁 四家透视 · 🃏 记牌器 · 🤖 AI 出牌建议与托管 · 🎯 自选目标牌 · 🔁 等价交换换牌 · 🎬 开局预设（每局发牌瞬间就变成你要的牌）。走页面自带的 PlayerUpdateGameData 通道，非房主可用；每次改动前后自动自检，手牌张数守恒、别人的牌局始终自洽。仅供朋友间娱乐。
 // @author       Eve
 // @match        https://game.hullqin.cn/*
 // @run-at       document-idle
 // @grant        none
 // @license      MIT
+// @homepageURL  https://github.com/qiaoda2021/hullqin-deck-forge
+// @supportURL   https://github.com/qiaoda2021/hullqin-deck-forge/issues
+// @downloadURL  https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js
+// @updateURL    https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js
 // ==/UserScript==
 (function () {
 /* ===== hq-lite.js ===== */

@@ -1,5 +1,21 @@
 # 控牌助手 · 斗地主 / 掼蛋 一体化
 
+## 一键安装
+
+先装 [Tampermonkey](https://www.tampermonkey.net/)（或 Violentmonkey），然后点这个链接：
+
+```
+https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js
+```
+
+油猴会弹出安装页，点「安装」即可。之后打开 `https://game.hullqin.cn/` 进斗地主或掼蛋，
+右上角出现面板就算成功（`Alt+D` 可以收起/展开）。
+
+自己的副本想更新：改完代码 `node build.js && node test/all.js`，再 `tools\push.cmd --repo hullqin-deck-forge`，
+油猴这边点「检查更新」就会拉到新版本（脚本头里有 `@updateURL` / `@downloadURL`）。
+
+---
+
 给 `game.hullqin.cn` 用的油猴脚本。**一块面板**里装下五件事：
 
 | | 功能 | 一句话 |
