@@ -92,10 +92,11 @@
     let lastSig = '';
     let snapshot = null;      // 换牌前的 raw（撤销 / 自动回滚用）
     let snapshotAt = 0;
+    let snapshotAfter = null;
+    let snapshotVersion = -1;
     let dealPlan = [];        // 开局预设：每局发牌瞬间要变成的牌
     let dealAuto = false;
     let dealDelay = 260;
-    let dealFiredVer = -1;    // 这一版已经自动执行过
     let aiAuto = false;       // AI 托管
     let aiPlayedSig = '';     // 托管已出手的回合签名
     let aiCache = { sig: '', v: null };
@@ -136,9 +137,12 @@
       if (!Object.keys(names).length) for (let s = 1; s <= seats; s++) names[s] = DG.seatName(s, ctx.mySeat, seats);
 
       const handsAll = {};
-      for (let s = 1; s <= seats; s++) handsAll[s] = v.hands[s] || [];
+      const handGroups = {};
+      for (let s = 1; s <= seats; s++) {
+        handsAll[s] = v.hands[s] || [];
+        handGroups[s] = DG.handGroups(handsAll[s], ctx.kind, v.level, seats);
+      }
 
-      const presetList = DG.presets(ctx.kind, v.level) || [];
       return {
         ok: true,
         kind: ctx.kind,
@@ -147,6 +151,8 @@
         mySeat: ctx.mySeat,
         seatNames: names,
         handsAll: handsAll,
+        handGroups: handGroups,
+        pool: DG.playedPool(ctx.raw, { seats: seats }),
         phase: v.phase,
         phaseText: v.phase,
         counts: v.counts,
@@ -159,10 +165,8 @@
         isOwner: !!(ctx.props.room && ctx.props.room.position === ctx.props.room.owner),
         isMyTurn: v.phase === 'play' && v.currentPlayer === ctx.mySeat,
         canDeal: !!(ctx.props.room && ctx.props.room.state === 0),
-        presets: presetList,
         ai: aiInfo(ctx),
         rec: recInfo(ctx),
-        deal: { cards: dealPlan.slice(), auto: dealAuto, delay: dealDelay },
         hint: ''
       };
     }
@@ -183,7 +187,7 @@
         if (!raw) return;
         const o = JSON.parse(raw) || {};
         if (Array.isArray(o.cards)) dealPlan = o.cards.map(Number).filter(function (c) { return c > 0; });
-        if (typeof o.auto === 'boolean') dealAuto = o.auto;
+        dealAuto = false;
         if (o.delay != null) dealDelay = Math.max(0, Math.min(3000, Number(o.delay) || 260));
       } catch (e) { /* ignore */ }
     }
@@ -192,34 +196,6 @@
       try {
         if (win) win.localStorage.setItem('dg.deal', JSON.stringify({ cards: dealPlan, auto: dealAuto, delay: dealDelay }));
       } catch (e) { /* ignore */ }
-    }
-
-    /** 预设是否已经在我手上（换成功了就不该再换） */
-    function dealSatisfied(ctx) {
-      if (!dealPlan.length) return true;
-      const mine = {};
-      (ctx.view.hands[ctx.mySeat] || []).forEach(function (c) { mine[c] = 1; });
-      for (let i = 0; i < dealPlan.length; i++) if (!mine[dealPlan[i]]) return false;
-      return true;
-    }
-
-    /** 到了「新一局刚发完牌」且预设开启 → 延迟一点点就改，别人第一眼看到的就是这套牌 */
-    function maybeAutoDeal(ctx) {
-      if (!dealAuto || !dealPlan.length) return false;
-      if (!newRoundOf(ctx)) return false;
-      if (dealSatisfied(ctx)) return false;
-      const ver = Number(ctx.props.game && ctx.props.game.version) || 0;
-      if (ver === dealFiredVer) return false;
-      dealFiredVer = ver;
-      const cards = dealPlan.slice();
-      const wait = Math.max(0, dealDelay);
-      setTimeout(function () {
-        if (!read()) return;
-        if (dealSatisfied(read())) return;
-        forge(cards, false);
-        toast('开局预设已生效（' + cards.length + ' 张）');
-      }, wait);
-      return true;
     }
 
     /* ── AI 建议 ── */
@@ -283,7 +259,7 @@
       }
       const v = ctx.view;
       lastVer = Number(ctx.props.game && ctx.props.game.version) || 0;
-      maybeAutoDeal(ctx);
+      // 仅从已出牌交换：开局预设停用，不再自动改发牌。
       const sig = [v.state, v.played.length, v.counts[1], v.counts[2], v.counts[3], v.counts[4] || 0,
         lastVer, ctx.kind, ctx.mySeat].join('|');
       // AI 托管：轮到我且还没为这一版出过手
@@ -320,20 +296,20 @@
       const plan = DG.plan(ctx.raw, cards, {
         mySeat: ctx.mySeat,
         seats: ctx.seats,
-        allowHole: !!opts.allowHole,
-        preferPool: true
+        give: Array.isArray(opts.give) ? opts.give : (ui ? ui.getGive() : [])
       });
       if (ui) ui.renderPlan(plan);
       if (!plan.ok) { toast(plan.error || '这个目标拿不到'); return; }
-      if (plan.noop) { toast('这些牌本来就在你手上'); return; }
+      if (plan.noop) { toast('请先选择换入和换出牌'); return; }
 
       const forged = DG.applyPlan(ctx.raw, plan);
-      const poolUsed = (plan.stats && plan.stats.freeGain) > 0;
-      const chk = DG.audit(ctx.raw, forged, { seats: ctx.seats, allowPool: poolUsed });
+      const chk = DG.audit(ctx.raw, forged, { seats: ctx.seats, mySeat: ctx.mySeat });
       if (ui) ui.renderAudit(chk);
       if (!chk.ok) { toast('自检没通过，已中止：' + chk.problems[0]); return; }
 
+      snapshotVersion = Number(ctx.props.game.version) || 0;
       snapshot = ctx.raw;
+      snapshotAfter = forged;
       snapshotAt = Date.now();
       busy = true;
       if (ui) ui.setBusy(true);
@@ -346,8 +322,9 @@
         busy = false;
         if (ui) ui.setBusy(false);
         if (!ok) {
-          toast('服务器没接受这次改动（版本冲突），已还原');
-          if (snapshot) { try { sendUpdate(snapshot); } catch (e) { /* ignore */ } }
+          toast('服务器未确认此次交换；保留当前牌局，请刷新重选');
+          // 广播已前进时不把旧局面覆盖回去。
+          snapshot = null; snapshotAfter = null;
           return;
         }
         toast('换牌成功：' + want.map(DG.cardText).join(' ') + '（' + sent + ' 字节）');
@@ -361,6 +338,7 @@
       (function poll() {
         const ctx = read();
         if (ctx && DG.rawEqual(ctx.raw, target)) { done(true); return; }
+        if (!ctx || (Number(ctx.props.game.version) || 0) !== snapshotVersion || !DG.rawEqual(ctx.raw, snapshot)) { done(false); return; }
         if (Date.now() - t0 > 1200) {
           if (attempt < 1) { retry(target, attempt + 1, done); return; }
           done(false);
@@ -398,8 +376,11 @@
 
     /* ── 撤销 ── */
     function revert() {
+      if (busy) return;
       if (!snapshot) { toast('没有可撤销的改动'); return; }
       if (Date.now() - snapshotAt > 60000) { toast('快照太旧（>60s），直接刷新吧'); return; }
+      const now = read();
+      if (!now || !snapshotAfter || !DG.rawEqual(now.raw, snapshotAfter)) { toast('牌局已有后续动作，旧快照已失效'); return; }
       try {
         sendUpdate(snapshot);
         toast('已还原到换牌前');
@@ -447,40 +428,22 @@
             aiPlayedSig = '';
             try { if (win) win.localStorage.setItem('dg.aiauto', aiAuto ? '1' : '0'); } catch (e) { /* ignore */ }
             toast(aiAuto ? 'AI 托管：开' : 'AI 托管：关');
-          } else if (name === 'deal-set') {
-            dealPlan = (payload && payload.cards || []).slice();
-            dealAuto = !!(payload && payload.auto);
-            if (payload && payload.delay != null) dealDelay = payload.delay;
-            saveDeal();
-            dealFiredVer = -1;
-            toast('开局预设已保存（' + dealPlan.length + ' 张），下一局生效');
-          } else if (name === 'deal-auto') {
-            dealAuto = !!(payload && payload.auto);
-            if (payload && Array.isArray(payload.cards) && payload.cards.length) dealPlan = payload.cards.slice();
-            if (payload && payload.delay != null) dealDelay = payload.delay;
-            saveDeal();
-            dealFiredVer = -1;
-            toast(dealAuto ? '开局自动改牌：开' : '开局自动改牌：关');
-          } else if (name === 'deal-delay') {
-            dealDelay = Number(payload) || 0;
-            saveDeal();
           }
         },
-        onChange: function (cards) {
+        onChange: function (cards, give) {
           const ctx = read();
           if (!ctx || !ui) return;
-          if (!cards.length) { ui.renderPlan(null); return; }
-          const plan = DG.plan(ctx.raw, cards, { mySeat: ctx.mySeat, seats: ctx.seats, preferPool: true });
+          if (!cards.length && !give.length) { ui.renderPlan(null); return; }
+          const plan = DG.plan(ctx.raw, cards, { mySeat: ctx.mySeat, seats: ctx.seats, give: give });
           ui.renderPlan(plan);
           if (plan.ok && !plan.noop) {
             const forged = DG.applyPlan(ctx.raw, plan);
-            ui.renderAudit(DG.audit(ctx.raw, forged, { seats: ctx.seats, allowPool: (plan.stats && plan.stats.freeGain) > 0 }));
+            ui.renderAudit(DG.audit(ctx.raw, forged, { seats: ctx.seats, mySeat: ctx.mySeat }));
           }
         },
         getPos: function () { return null; },
         setPos: function (p) { try { win.localStorage.setItem('dg.pos', JSON.stringify(p)); } catch (e) { /* ignore */ } }
       });
-      ui.setDeal({ cards: dealPlan, auto: dealAuto, delay: dealDelay });
       ui.setAiAuto(aiAuto);
 
       try {
@@ -542,11 +505,9 @@
       setDeal: function (d) {
         d = d || {};
         if (Array.isArray(d.cards)) dealPlan = d.cards.map(Number).filter(function (c) { return c > 0; });
-        if (typeof d.auto === 'boolean') dealAuto = d.auto;
+        dealAuto = false;
         if (d.delay != null) dealDelay = Math.max(0, Math.min(3000, Number(d.delay) || 0));
         saveDeal();
-        dealFiredVer = -1;
-        if (ui) ui.setDeal({ cards: dealPlan, auto: dealAuto, delay: dealDelay });
       },
       setAiAuto: function (v) {
         aiAuto = !!v;

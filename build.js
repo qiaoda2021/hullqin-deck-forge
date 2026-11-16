@@ -12,7 +12,7 @@ const OUT_NAME = 'hullqin-deck-forge.user.js';
 const META = {
   name: '控牌助手（斗地主 / 掼蛋）',
   namespace: 'hullqin-deck-forge',
-  version: '2.1.0',
+  version: '2.2.0',
   author: 'Eve',
   license: 'MIT',
   match: 'https://game.hullqin.cn/*',
@@ -20,9 +20,8 @@ const META = {
   repo: 'https://github.com/qiaoda2021/hullqin-deck-forge',
   updateURL: 'https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js',
   description:
-    '斗地主 / 掼蛋 一体化牌局助手：👁 四家透视 · 🃏 记牌器 · 🤖 AI 出牌建议与托管 · 🎯 自选目标牌 · 🔁 等价交换换牌 · ' +
-    '🎬 开局预设（每局发牌瞬间就变成你要的牌）。走页面自带的 PlayerUpdateGameData 通道，非房主可用；每次改动前后自动自检，' +
-    '手牌张数守恒、别人的牌局始终自洽。仅供朋友间娱乐。'
+    '斗地主 / 掼蛋 一体化牌局助手：👁 叠牌透视（炸弹 / 同花顺高亮） · 🃏 记牌器 · 🤖 AI 建议与托管 · ' +
+    '🔁 仅从已出牌交换，手选换出手牌，其他人的在手牌保持不变。仅供朋友间娱乐。'
 };
 
 // 顺序即依赖顺序：后面的模块可以直接用前面挂到 window 的全局
@@ -34,6 +33,7 @@ const MODULES = [
   'vendor/ddz.core.js',
   'vendor/gd.core.js',
   'vendor/gd.ai.js',
+  'vendor/gd.site.core.js',
   'dg.core.js',
   'dg.ai.js',
   'dg.recorder.js',

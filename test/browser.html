@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>叠牌透视 / 已出牌交换 · 浏览器验收</title>
+<style>
+body{margin:0;min-height:100vh;background:radial-gradient(ellipse at top left,#234e3c,#0b1520 70%);color:#e3ebf5;font:15px/1.7 'Segoe UI','Microsoft YaHei',sans-serif}
+main{margin:80px 38px;width:530px}h1{font-size:26px;color:#f1d5a0}li{margin:8px 0}pre{white-space:pre-wrap;padding:16px;background:#0c1524;border:1px solid #465b71;border-radius:10px;font:13px/1.65 monospace}
+.legend{color:#91b7a4}.ddz-poker{display:none}
+</style>
+<script>window.testErrors=[];addEventListener('error',e=>testErrors.push(e.message));addEventListener('unhandledrejection',e=>testErrors.push(String(e.reason)));</script>
+</head>
+<body>
+<main><h1>叠牌透视与手选换牌</h1>
+<ul><li>同点数纵向叠放，白色牌面、红黑花色。</li><li>金框：炸弹、王炸。青框：同花顺。紫底：逢人配。</li><li>换入只选已出牌，换出只选我的手牌。</li><li>两边必须等量。其他人的在手牌逐张不变。</li></ul>
+<p class="legend">此页加载最终单文件构建产物；牌局和广播均为本地夹具。</p>
+<pre id="browser-result">RUNNING</pre></main>
+<div class="ddz-poker" id="fake-card"></div>
+<script src="../dist/hullqin-deck-forge.user.js"></script>
+<script>
+(function(){
+  const desired=[3,16,29,42,31,32,33,34,35,53,54,107,108,13,26,39,52];
+  const cpl=new Array(108).fill(0);desired.forEach(id=>{cpl[id-1]=1;});
+  const rest=Array.from({length:108},(_,i)=>i+1).filter(id=>!desired.includes(id));
+  for(let seat=1;seat<=4;seat++)for(let n=seat===1?desired.length:0;n<27;n++)cpl[rest.shift()-1]=seat;
+  const targets=[cpl.indexOf(2)+1,cpl.indexOf(3)+1];targets.forEach(id=>{cpl[id-1]=0;});
+  const raw={rule:2,state:4,landlordId:0,cardPositionList:cpl,playedCardList:[0,targets[0],0,0,0,0,targets[1]],v:1,
+    team13Level:2,team24Level:2,lastRankList:[],tributeCardList:[],returnCardList:[],firstPlayer:2,
+    playedTypeList:[GDSite.bestCode([targets[0]],0,2),0,0,0,GDSite.bestCode([targets[1]],0,2)]};
+  const sent=[];
+  const props={room:{position:1,owner:2,state:1,playerList:[{nickname:'我'},{nickname:'下家'},{nickname:'对家'},{nickname:'上家'}]},
+    game:{version:1,data:DG.encodeGameData(raw)},send(key,payload){sent.push({key,payload});props.game={version:props.game.version+1,data:payload.data};}};
+  document.getElementById('fake-card').__reactFiber$fixture={memoizedProps:props,return:null};
+  document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>{
+    const lines=[];let pass=0;const fails=[];
+    function check(ok,name){lines.push((ok?'PASS ':'FAIL ')+name);if(ok)pass++;else fails.push(name);}
+    try{
+      const ctl=window.HQX,ui=ctl.getUi(),root=ui.shadow;
+      check(document.querySelectorAll('.hqx-dg').length===1,'单实例面板');
+      check(root.querySelectorAll('.eyes .hh').length===4,'四家叠牌显示');
+      check(root.querySelectorAll('.eyes .poker-card').length===106,'106张在场牌且无重复');
+      check(root.querySelectorAll('.eyes .bomb').length>=2,'炸弹分组');
+      check(root.querySelectorAll('.eyes .flush').length>=1,'同花顺分组');
+      const bomb=root.querySelector('.bomb'),flush=root.querySelector('.flush');
+      check(getComputedStyle(bomb).borderTopColor!==getComputedStyle(flush).borderTopColor,'炸弹与同花顺颜色区分');
+      const stack=Array.from(root.querySelectorAll('.eyes .card-stack')).find(n=>n.children.length>=4);
+      check(!!stack&&stack.children[1].getBoundingClientRect().top-stack.children[0].getBoundingClientRect().top===20,'纵向叠放20px');
+      const panel=ui.panel.getBoundingClientRect();
+      check(panel.width===Math.min(442,document.documentElement.clientWidth-24)&&panel.height<=Math.min(760,innerHeight*.78),'面板适配窗口且高度受限');
+      check(panel.left>=0&&panel.right<=innerWidth,'面板在窗口内');
+      check(!root.querySelector('.deal'),'旧开局抢牌入口移除');
+      const acts=root.querySelector('.acts');
+      check(acts.children[0].disabled,'空选择禁用换牌');
+      const target=root.querySelector('.swap-pool .poker-card');target.click();
+      check(ui.getSelected().length===1&&acts.children[0].disabled,'只选换入时保持禁用');
+      const giver=root.querySelector('.give-picker .poker-card');const giveId=Number(giver.dataset.card);giver.click();
+      check(ui.getGive()[0]===giveId&&!acts.children[0].disabled,'用户手选换出牌后启用');
+      check(root.querySelector('.give-picker .chosen').getAttribute('aria-pressed')==='true','选中可见且无障碍状态同步');
+      const targetId=ui.getSelected()[0];acts.children[0].click();
+      const after=DG.decodeGameData(props.game.data);
+      check(sent.length===1&&sent[0].key===0,'单笔交换发送');
+      check(DG.audit(raw,after,{mySeat:1,seats:4}).ok,'交换字节符合数量与归属约束');
+      const beforeView=DG.expand(raw),afterView=DG.expand(after);
+      check([2,3,4].every(s=>JSON.stringify(beforeView.hands[s])===JSON.stringify(afterView.hands[s])),'三家手牌逐张不变');
+      check(afterView.hands[1].includes(targetId)&&!afterView.hands[1].includes(giveId),'严格执行所选换入与换出');
+      ctl.tick();check(!ui.getSelected().length&&!ui.getGive().length,'成功后清除失效选择');
+      ctl.revert();ctl.tick();check(DG.rawEqual(ctl.read().raw,raw),'撤销完整还原');
+      ui.setSelected([targetId]);ui.setGive([giveId]);
+      if(location.search.includes('exchange'))root.querySelector('.bd').scrollTop=root.querySelector('.swap-pool').offsetTop-160;
+      check(!testErrors.length,'无页面未捕获错误');
+      const out=document.getElementById('browser-result');
+      out.textContent='PASS '+pass+' / FAIL '+fails.length+'\n'+lines.join('\n');
+      out.dataset.failed=String(fails.length);
+      document.title='PASS '+pass+' / FAIL '+fails.length;
+    }catch(e){document.getElementById('browser-result').textContent='ERROR '+e.stack;document.getElementById('browser-result').dataset.failed='1';}
+  },120));
+})();
+</script>
+</body>
+</html>

@@ -14,7 +14,8 @@ const FILES = [
   'test/dg.recorder.test.js',
   'test/dg.site.test.js',
   'test/dg.integration.test.js',
-  'test/dist.test.js'
+  'test/dist.test.js',
+  'test/push-github.test.mjs'
 ];
 
 const rows = [];

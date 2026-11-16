@@ -118,207 +118,119 @@ group('1. 展开（expand）');
   eq(v.holes.length, 8, '1.21 8 张底牌');
 }
 
-/* ════════════════════════════ 2. 换牌（等价交换）════════════════════════════ */
+/* 已出牌交换的回归与边界 */
+function discard(raw, ids) {
+  ids.forEach(function (id) { raw.cardPositionList[id - 1] &= 8; if (raw.playedCardList.length) raw.playedCardList.push(...Array(raw.rule === 2 || raw.cardPositionList.length === 108 ? 3 : 2).fill(0)); raw.playedCardList.push(0, id); raw.playedTypeList = raw.playedCardList.filter(x => x === 0).map(() => 0); });
+}
 
-group('2. 换牌：等价交换');
-
-{
-  const raw = makeDeal('gd', 4, 21);
-  const v = DG.expand(raw, { seats: 4 });
-  const mySeat = 2;
-  const want = [53, 54, 107, 108];                       // 四大天王
-  const p = DG.plan(raw, want, { mySeat, seats: 4 });
-  ok(p.ok && !p.noop, '2.1 方案可执行', p.error);
-  eq(p.gained.length, 4, '2.2 拿到 4 张');
-  eq(p.given.length, 4, '2.3 送出 4 张（等价交换）');
+group('2. 已出牌交换与手选换出');
+for (const kind of ['gd', 'ddz']) {
+  const seats = kind === 'gd' ? 4 : 3;
+  const raw = makeDeal(kind, seats, 21);
+  discard(raw, [53, 54]);
+  const v = DG.expand(raw, { seats });
+  const give = v.hands[2].slice(0, 2);
+  const saved = clone(raw);
+  const p = DG.plan(raw, [53, 54], { mySeat: 2, seats, give });
+  ok(p.ok && !p.noop, kind + ' 已出牌方案可执行', p.error);
+  eq(p.given, give, kind + ' 严格使用指定换出牌');
+  eq(p.gained, [53, 54], kind + ' 换入物理ID一致');
+  eq(raw, saved, kind + ' 计算不改变入参');
   const after = DG.applyPlan(raw, p);
-  const a = DG.audit(raw, after, { seats: 4 });
-  ok(a.ok, '2.4 审计通过', a.problems.join(' / '));
-  eq(a.touched.length, 8, '2.5 只动了 8 个索引');
-  const v2 = DG.expand(after, { seats: 4 });
-  eq([1, 2, 3, 4].map(s => v2.counts[s]), [27, 27, 27, 27], '2.6 张数仍 27/27/27/27');
-  ok(want.every(c => v2.hands[mySeat].includes(c)), '2.7 四张王都到了我手上');
-  eq(v2.played.length, 0, '2.8 没碰已出牌记录');
+  const audit = DG.audit(raw, after, { seats, mySeat: 2 });
+  ok(audit.ok, kind + ' 审计通过', audit.problems.join('/'));
+  const v2 = DG.expand(after, { seats });
+  for (let seat = 1; seat <= seats; seat++) {
+    eq(v2.counts[seat], v.counts[seat], kind + ' 座位' + seat + '张数不变');
+    if (seat !== 2) eq(v2.hands[seat], v.hands[seat], kind + ' 座位' + seat + '手牌逐张不变');
+  }
+  eq(after.playedCardList, [0, give[0], ...Array(seats - 1).fill(0), 0, give[1]], kind + ' 历史槽位一对一替换');
+  ok(!v2.played.some(id => v2.hands[2].includes(id)), kind + ' 无已出牌与手牌重复');
+  eq(DG.revertPlan(after,p), raw, kind + ' 反向交换完整还原');
+  eq(DG.plan(raw, [v.hands[1][0]], { mySeat:2, seats, give:[give[0]] }).ok, false, kind + ' 持有者是他人时拦截');
+  eq(DG.plan(raw, [give[0]], { mySeat:2, seats, give:[give[1]] }).ok, false, kind + ' 我的在手牌也不是换入来源');
+  eq(DG.plan(raw, [53], { mySeat:2, seats }).ok, false, kind + ' 缺少手选换出时拦截');
+  eq(DG.plan(raw, [53], { mySeat:2, seats, give }).ok, false, kind + ' 数量不匹配时拦截');
+  eq(DG.plan(raw, [53], { mySeat:2, seats, give:[v.hands[1][0]] }).ok, false, kind + ' 选别人的手牌换出时拦截');
+  eq(DG.plan(raw, [53,53], { mySeat:2, seats, give }).ok, false, kind + ' 重复换入ID拦截');
+  eq(DG.plan(raw, [53,54], { mySeat:2, seats, give:[give[0],give[0]] }).ok, false, kind + ' 重复换出ID拦截');
+  eq(DG.plan(raw, [999], { mySeat:2, seats, give:[give[0]] }).ok, false, kind + ' 越界ID拦截');
+  eq(DG.plan(raw, [53.5], { mySeat:2, seats, give:[give[0]] }).ok, false, kind + ' 小数ID拦截');
+  eq(DG.plan(raw, [53], { mySeat:0, seats, give:[give[0]] }).ok, false, kind + ' 观战不交换');
+  eq(DG.plan({...raw,state:9}, [53], { mySeat:2, seats, give:[give[0]] }).ok, false, kind + ' 局终不交换');
+  const bad = clone(after); bad.state = 3;
+  ok(!DG.audit(raw,bad,{seats,mySeat:2}).ok, kind + ' 篡改回合被审计抓住');
+  const stale = clone(raw); stale.cardPositionList[give[0]-1]=1;
+  eq(DG.plan(stale,[53,54],{mySeat:2,seats,give}).ok,false,kind+' 换出已不属于我时拦截');
+  const badHistory = clone(after); badHistory.playedCardList[1]=53;
+  ok(!DG.audit(raw,badHistory,{seats,mySeat:2}).ok,kind+' 已出牌与手牌冲突被抓住');
+  ok(!DG.audit(raw,after,{seats,mySeat:1}).ok,kind+' 审计绑定我的座位');
+  const no = DG.plan(raw,[],{mySeat:2,seats,give:[]});
+  ok(no.ok && no.noop,kind+' 空选择不发送');
+  let threw = false; try { DG.applyPlan(raw,{ok:false,changes:[]}); } catch(e) { threw=true; }
+  ok(threw,kind+' 拒绝应用失败方案');
 }
 
+group('3. 暗池、底牌和非法历史');
 {
-  const raw = makeDeal('gd', 4, 23);
-  const mySeat = 3;
-  const v0 = DG.expand(raw, { seats: 4 });
-  const hand0 = v0.hands[mySeat].slice();
-  const want = [1, 14, 27, 40];
-  const p = DG.plan(raw, want, { mySeat, seats: 4 });
-  const after = DG.applyPlan(raw, p);
-  const v1 = DG.expand(after, { seats: 4 });
-  const union0 = new Set(hand0);
-  const union1 = new Set(v1.hands[mySeat]);
-  eq([...union0].filter(x => !union1.has(x)).length, p.given.length, '2.9 我恰好少了 given.length 张');
-  eq([...union1].filter(x => !union0.has(x)).length, p.gained.length, '2.10 我恰好多了 gained.length 张');
-  eq(v1.hands[mySeat].length, hand0.length, '2.11 我的张数不变');
-  ok(p.donors.length >= 1 && p.donors.every(d => d.got.length === d.gave.length), '2.12 每个 donor 收支相等');
+  const raw=makeDeal('ddz',2,31), v=DG.expand(raw,{seats:2});
+  const mine=v.hands[1][0];
+  for(const id of v.unowned) {
+    ok(!DG.plan(raw,[id],{mySeat:1,seats:2,give:[mine],allowHole:true,allowPool:true,preferPool:true}).ok,'所有无主暗池/底牌均拦截 '+id);
+  }
+  const malformed=makeDeal('gd',4,44); discard(malformed,[53]); malformed.playedCardList.push(0,53);
+  ok(!DG.plan(malformed,[53],{mySeat:2,give:[DG.expand(malformed).hands[2][0]]}).ok,'流水重复ID时整笔拒绝');
+  const pair=makeDeal('gd',4,45);
+  pair.cardPositionList[2]=0; pair.cardPositionList[15]=0; pair.playedCardList=[0,3,16]; pair.playedTypeList=[(2<<8)|3];
+  pair.cardPositionList[3]=2; pair.cardPositionList[4]=2;
+  ok(!DG.plan(pair,[3],{mySeat:2,give:[4]}).ok,'将历史对子改成杂牌时阻止');
+  pair.cardPositionList[16]=2;
+  const good=DG.plan(pair,[3,16],{mySeat:2,give:[4,17]});
+  ok(good.ok,'同时换整对时保留原牌型',good.error);
+  eq(good.types,[(2<<8)|4],'历史解读更新为新对子');
+  const forbidden=clone(pair); forbidden.cardPositionList[3]=1; forbidden.cardPositionList[5]=2;
+  ok(!DG.audit(pair,forbidden,{mySeat:2}).ok,'张数守恒的他人手牌互换仍被拦截');
 }
 
-/* ════════════════════════════ 3. 换牌：无主暗池 ════════════════════════════ */
-
-group('3. 换牌：无主暗池（零代价）');
-
+group('3.1 压牌链与四人规则边界');
+for (const kind of ['gd', 'ddz']) {
+  const seats = kind === 'gd' ? 4 : 3;
+  const raw = { rule: kind === 'gd' ? 2 : 0, state: 3, firstPlayer: 1,
+    cardPositionList: Array(kind === 'gd' ? 108 : 54).fill(3),
+    playedCardList: [0,3,0,5], playedTypeList: [259,261], team13Level: 2, team24Level: 2 };
+  raw.cardPositionList[2] = 0; raw.cardPositionList[4] = 0;
+  ok(!DG.plan(raw,[3],{mySeat:3,seats,give:[6]}).ok,kind+' 前手变大导致后手压不住时拦截');
+  ok(!DG.plan(raw,[5],{mySeat:3,seats,give:[16]}).ok,kind+' 后手变小压不住前手时拦截');
+  const p=DG.plan(raw,[3],{mySeat:3,seats,give:[4]});
+  ok(p.ok,kind+' 合法3→4且后手5仍能压时允许',p.error);
+  const passed={...raw,playedCardList:[0,3,...Array(seats-1).fill(0),0,5],playedTypeList:[]};
+  ok(DG.plan(passed,[3],{mySeat:3,seats,give:[6]}).ok,kind+' 新墩不错误比较上一墩');
+  const invalid={...raw,playedCardList:[3,0,5]};
+  ok(!DG.plan(invalid,[3],{mySeat:3,seats,give:[4]}).ok,kind+' 缺动作分隔的历史中止');
+}
 {
-  const raw = makeDeal('ddz', 2, 31);
-  const v = DG.expand(raw, { seats: 2 });
-  const pool = v.unowned.filter(c => !v.holes.includes(c));
-  const mySeat = 1;
-  const want = pool.slice(0, 5);
-  const p = DG.plan(raw, want, { mySeat, seats: 2 });
-  ok(p.ok, '3.1 从暗池取牌成功', p.error);
-  eq(p.given.length, 0, '3.2 不需要送出任何牌');
-  eq(p.stats.freeGain, 5, '3.3 5 张全部来自暗池');
-  eq(p.risk.level, 'none', '3.4 风险等级 = 无痕');
-  const after = DG.applyPlan(raw, p);
-  const a = DG.audit(raw, after, { seats: 2, allowPool: true });
-  ok(a.ok, '3.5 审计通过（已放行暗池）', a.problems.join(' / '));
-  eq(a.poolTaken, 5, '3.5b 账本记录暗池少 5 张');
-  const aDeny = DG.audit(raw, after, { seats: 2 });
-  ok(!aDeny.ok && aDeny.problems.some(s => s.includes('未开启暗池')), '3.5c 不放行时会被标为「动了无主区」', aDeny.problems.join(' / '));
-  eq(a.touched.length, 5, '3.6 只动了 5 个索引');
-  const v2 = DG.expand(after, { seats: 2 });
-  eq(v2.hands[mySeat].length, 17 + 5, '3.7 我 22 张（暗池里没人看得到）');
-  eq(v2.unowned.length, 15, '3.8 暗池少 5 张');
+  const raw={rule:0,state:1,cardPositionList:Array(108).fill(2),playedCardList:[0,3,16,29,4],playedTypeList:[]};
+  [3,16,29,4].forEach(id=>raw.cardPositionList[id-1]=0);
+  ok(!DG.plan(raw,[4],{mySeat:2,seats:4,give:[5]}).ok,'四人模式不使用三人三带一牌型');
+  ok(!DG.handGroups([53,54],'ddz',2,4).some(g=>g.kind==='bomb'),'四人两王不是王炸');
+  ok(!DG.handGroups([53,54,107],'ddz',2,4).some(g=>g.kind==='bomb'),'四人三王不是王炸');
+  ok(DG.handGroups([53,54,107,108],'ddz',2,4).some(g=>g.kind==='bomb'&&g.cards.length===4),'四人四王高亮王炸');
 }
 
-/* ════════════════════════════ 4. 底牌门禁 ════════════════════════════ */
-
-group('4. 底牌门禁');
-
+group('4. 扑克牌分组与高亮');
 {
-  const raw = makeDeal('ddz', 3, 41);
-  const v = DG.expand(raw, { seats: 3 });
-  const mySeat = 1;
-  const p = DG.plan(raw, [v.holes[0]], { mySeat, seats: 3 });
-  ok(!p.ok || p.noop, '4.1 默认不动底牌', 'changes=' + p.changes.length);
-  ok(p.notes.join(' ').includes('跳过') || (p.error || '').includes('底牌'), '4.2 给出跳过原因', JSON.stringify(p.notes) + '|' + p.error);
-
-  const p2 = DG.plan(raw, [v.holes[0]], { mySeat, seats: 3, allowHole: true });
-  ok(p2.ok && p2.gained.includes(v.holes[0]), '4.3 allowHole 后才能动底牌');
-  const after = DG.applyPlan(raw, p2);
-  const v2 = DG.expand(after, { seats: 3 });
-  ok(v2.holes.includes(v.holes[0]), '4.4 底牌标记随牌走（仍显示在底牌区）');
-  ok(v2.hands[mySeat].includes(v.holes[0]), '4.5 底牌进入我的手牌');
-}
-
-/* ════════════════════════════ 5. 边界情况 ════════════════════════════ */
-
-group('5. 边界情况');
-
-{
-  const raw = makeDeal('gd', 4, 43);
-  const v = DG.expand(raw, { seats: 4 });
-  const mine = v.hands[2];
-  const p = DG.plan(raw, mine.slice(0, 3), { mySeat: 2, seats: 4 });
-  ok(p.ok && p.noop, '5.1 目标牌全是我已有的 → noop', JSON.stringify({ ok: p.ok, noop: p.noop, err: p.error }));
-  eq(p.changes.length, 0, '5.2 没有改动');
-
-  const p2 = DG.plan(raw, mine, { mySeat: 2, seats: 4 });
-  eq(p2.risk.level, 'none', '5.3 全副手牌当目标 → 无风险');
-  eq(p2.changes.length, 0, '5.4 仍然没有改动');
-
-  const p3 = DG.plan(raw, [1, 14, 27, 40], { mySeat: 0, seats: 4 });
-  ok(!p3.ok && p3.error.includes('座位'), '5.5 没有座位时报错', p3.error);
-}
-
-/* ════════════════════════════ 6. 审计的对抗性 ════════════════════════════ */
-
-group('6. 审计对抗（故意造坏数据）');
-
-{
-  const raw = makeDeal('gd', 4, 47);
-  const bad = clone(raw);
-  bad.cardPositionList[0] = 3;                 // 把一张牌凭空塞给 3 号
-  const a = DG.audit(raw, bad, { seats: 4 });
-  ok(!a.ok, '6.1 张数不守恒被抓住', a.problems.join(' / '));
-  ok(a.problems.some(s => s.includes('张数')), '6.2 报的是张数问题');
-
-  const bad2 = clone(raw);
-  bad2.state = 2;
-  const a2 = DG.audit(raw, bad2, { seats: 4 });
-  ok(!a2.ok && a2.problems.some(s => s.includes('state')), '6.3 改 state 被发现');
-
-  const bad3 = clone(raw);
-  bad3.playedCardList = [0, raw.cardPositionList.indexOf(2) + 1];
-  const a3 = DG.audit(raw, bad3, { seats: 4 });
-  ok(!a3.ok && a3.problems.some(s => s.includes('已打出')), '6.4 已出牌记录被改 → 被发现', a3.problems.join(' / '));
-}
-
-{
-  // 把一张牌从 1 号挪到 2 号（不守恒）
-  const raw = makeDeal('ddz', 3, 53);
-  const v = DG.expand(raw, { seats: 3 });
-  const bad = clone(raw);
-  const card = v.hands[1][0];
-  bad.cardPositionList[card - 1] = 2;
-  const a = DG.audit(raw, bad, { seats: 3 });
-  ok(!a.ok, '6.5 单方面转移被抓住', a.problems.join(' / '));
-  ok(a.problems.some(s => s.includes('1号')), '6.6 指出是 1 号少牌');
-}
-
-/* ════════════════════════════ 7. 回滚 ════════════════════════════ */
-
-group('7. 回滚');
-
-{
-  const raw = makeDeal('gd', 4, 59);
-  const p = DG.plan(raw, [53, 54], { mySeat: 1, seats: 4 });
-  const after = DG.applyPlan(raw, p);
-  const back = DG.revertPlan(after, p);
-  eq(back.cardPositionList, raw.cardPositionList, '7.1 回滚后 cardPositionList 完全一致');
-  const a = DG.audit(raw, back, { seats: 4 });
-  ok(a.ok, '7.2 回滚后审计通过');
-}
-
-/* ════════════════════════════ 8. 出牌后再审计 ════════════════════════════ */
-
-group('8. 换牌 → 出牌 后仍自洽');
-
-{
-  const raw = makeDeal('gd', 4, 61);
-  const mySeat = 2;
-  const want = [53, 54, 107, 108];
-  const p = DG.plan(raw, want, { mySeat, seats: 4 });
-  const forged = DG.applyPlan(raw, p);
-
-  // ① 换牌这一段：必须过审计（别人逐帧比对也只看得到「等价交换」）
-  const a1 = DG.audit(raw, forged, { seats: 4 });
-  ok(a1.ok, '8.1 换牌段审计通过', a1.problems.join(' / '));
-  const vf = DG.expand(forged, { seats: 4 });
-  ok(vf.hands[mySeat].includes(53), '8.1b 换完之后 53 确实在我手上');
-
-  // ② 模拟站点出牌：清零 + 写进 playedCardList + state 前移
-  const play = [53];
-  const cpl = forged.cardPositionList.slice();
-  play.forEach(c => { cpl[c - 1] = 0; });
-  const after = Object.assign({}, forged, {
-    cardPositionList: cpl,
-    playedCardList: [0].concat(play),
-    state: 3,
-    playedTypeList: [0]
-  });
-
-  const v = DG.expand(after, { seats: 4 });
-  eq(v.counts[mySeat], 26, '8.2 我出掉 1 张 → 26 张');
-  ok(!v.hands[mySeat].includes(53), '8.3 打出的牌不在我手上');
-  eq(v.played.length, 1, '8.4 已出牌记录 1 张');
-
-  // ③ 其他人视角：「他打的牌」必须本来就登记在他名下（不许凭空造牌）
-  ok(vf.hands[mySeat].includes(v.played[0]), '8.5 打出的牌在打之前确实属于我');
-  ok([1, 2, 3, 4].every(s => v.counts[s] >= 0), '8.6 没有人负数');
-  const replay = DG.expand(after, { seats: 4 });
-  eq(replay.played, [53], '8.7 桌面牌面可被 GDSite 复现');
-
-  // ④ 出牌段自己的不变量（不复用换牌段的账本）
-  const cplA = forged.cardPositionList;
-  const cplB = after.cardPositionList;
-  const cleared = cplB.map((v2, i) => (Number(v2) || 0) !== (Number(cplA[i]) || 0) ? i + 1 : 0).filter(Boolean);
-  eq(cleared, play, '8.8 出牌只清零了我要出的那几张');
-  ok(after.playedCardList.slice(0, forged.playedCardList.length).join() === forged.playedCardList.join(), '8.9 出牌只追加、不改写历史');
+  const cards=[3,16,29,42,31,32,33,34,35,53,54,107,108];
+  const groups=DG.handGroups(cards,'gd',2);
+  eq(groups.flatMap(g=>g.cards).sort((a,b)=>a-b),cards.slice().sort((a,b)=>a-b),'所有物理牌恰好显示一次');
+  ok(groups.some(g=>g.kind==='bomb'&&g.cards.length===4&&g.cards.includes(53)),'四大天王高亮');
+  ok(groups.some(g=>g.kind==='bomb'&&g.cards.includes(3)),'同点数炸弹高亮');
+  ok(groups.some(g=>g.kind==='flush'&&g.cards.includes(31)),'同花顺高亮');
+  ok(!DG.handGroups([31,33,34,35,36],'gd',2).some(g=>g.kind==='flush'),'断张不标同花顺');
+  const wild=DG.handGroups([3,16,29,28],'gd',2);
+  ok(wild.some(g=>g.kind==='bomb'&&g.cards.includes(28)),'逢人配参与炸弹');
+  ok(!DG.handGroups([53,54],'gd',2).some(g=>g.kind==='bomb'),'掼蛋两王不误标为四大天王');
+  ok(DG.handGroups([53,54],'ddz',2).some(g=>g.kind==='bomb'),'斗地主两王标王炸');
+  eq(DG.handGroups([],'gd',2),[],'空手牌无分组');
 }
 
 /* ════════════════════════════ 9. 预设 ════════════════════════════ */
@@ -358,11 +270,13 @@ group('10. 与站点等价实现（GDSite）对齐');
   eq(mine.level, theirs.level, '10.3 级牌一致');
   eq(mine.phase, theirs.phase, '10.4 阶段一致');
 
-  const p = DG.plan(raw, [53, 54], { mySeat: 1, seats: 4 });
+  discard(raw,[53,54]);
+  const oldCount=DG.expand(raw).counts[1];
+  const p = DG.plan(raw, [53, 54], { mySeat: 1, seats: 4, give: DG.expand(raw).hands[1].slice(0,2) });
   const after = DG.applyPlan(raw, p);
   const theirAfter = GDSite.expandState(after);
   ok(theirAfter.playerCardLists[1].includes(53) && theirAfter.playerCardLists[1].includes(54), '10.5 GDSite 也认为两张王到了我手上');
-  ok(theirAfter.playerRestCardCounts[1] === theirs.playerRestCardCounts[1], '10.6 GDSite 看到的张数没变');
+  ok(theirAfter.playerRestCardCounts[1] === oldCount, '10.6 GDSite 看到的张数没变');
   const warns = theirAfter.playerCardLists[1].filter(c => c === 53).length;
   eq(warns, 1, '10.7 大王只有一张（没有复制牌）');
 }
@@ -391,7 +305,8 @@ group('11. protobuf 往返（与 GDSite 编解码互通）');
   eq(myRead.returnCardList.length, 2, '11.9 空值数组不丢结构');
 
   // 换牌后重新编码 → 站点解码器必须看到新牌面
-  const p = DG.plan(raw, [53, 54, 107, 108], { mySeat: 2, seats: 4 });
+  discard(raw,[53,54,107,108]);
+  const p = DG.plan(raw, [53, 54, 107, 108], { mySeat: 2, seats: 4, give: DG.expand(raw).hands[2].slice(0,4) });
   const forged = DG.applyPlan(raw, p);
   const wire = DG.encodeGameData(forged);
   const remote = GDSite.decodeGameData(wire);

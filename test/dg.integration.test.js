@@ -153,45 +153,16 @@ async function main() {
     onChange: function () {}
   });
 
-  ok(collect(ui.shadow, 'deal').length === 1, '1.1 有「开局预设」区块');
+  ok(collect(ui.shadow, 'swap-pool').length === 1, '1.1 有已出牌换入区块');
   ok(collect(ui.shadow, 'ai').length === 1, '1.2 有「AI 建议」区块');
   ok(collect(ui.shadow, 'rec').length === 1, '1.3 有「记牌器」区块');
-  ok(!!byText(ui.shadow, '存为预设'), '1.4 有「存为预设」按钮');
-  ok(!!byText(ui.shadow, '每局自动'), '1.5 有「每局自动」开关');
+  ok(collect(ui.shadow, 'give-picker').length === 1, '1.4 有手选换出区块');
+  ok(!byText(ui.shadow, '每局自动'), '1.5 无自动改牌旁路');
   ok(!!byText(ui.shadow, '托管'), '1.6 有「托管」按钮');
 
-  /* ── 2. 预设读写 ── */
-  group('2. 开局预设');
-
-  ui.setDeal({ cards: [53, 54, 107, 108], auto: true, delay: 90 });
-  eq(ui.getDeal(), { cards: [53, 54, 107, 108], auto: true, delay: 90 }, '2.1 setDeal / getDeal 对称');
-  ok(collect(ui.shadow, 'pc').length >= 4, '2.2 预设牌渲染成小牌片');
-  ok(byText(ui.shadow, '每局自动 · 开') != null, '2.3 开关文案变成「开」');
-
-  ui.setDeal({ cards: [], auto: false, delay: 260 });
-  eq(ui.getDeal().cards, [], '2.4 清空预设');
-
-  /* ── 3. 点「存为预设」把当前选择存进去 ── */
-  group('3. 交互');
-
-  ui.setSelected([53, 54]);
-  actions.length = 0;
-  const btnSave = byText(ui.shadow, '存为预设');
-  btnSave.click();
-  eq(actions.length, 1, '3.1 点了就发 action');
-  eq(actions[0].a, 'deal-set', '3.2 action = deal-set');
-  eq((actions[0].p || {}).cards, [53, 54], '3.3 带的是当前选中的牌');
-  eq((actions[0].p || {}).auto, true, '3.4 顺手把「每局自动」打开');
-  ui.setDeal({ cards: [], auto: false, delay: 260 });
-
-  /* ── 4. 忙碌态 ── */
-  group('4. 忙碌态');
-
-  ui.setSelected([1]);
-  ui.setBusy(true);
-  ok(byText(ui.shadow, '存为预设').disabled === true, '4.1 忙碌时「存为预设」禁用');
-  ui.setBusy(false);
-  ok(byText(ui.shadow, '存为预设').disabled === false, '4.2 空闲后恢复');
+  group('2. 不再展示旧开局预设');
+  eq(collect(ui.shadow,'deal').length,0,'旧开局预设未挂到DOM');
+  eq(byText(ui.shadow,'存为预设'),null,'无开局抢牌入口');
 
   /* ── 5. AI 区 ── */
   group('5. AI 建议');
@@ -223,104 +194,23 @@ async function main() {
   ok((collect(recSec, 'line').map(function (e) { return e.textContent; }).join('|')).indexOf('⚠') >= 0, '6.3 有威胁预警');
   ok((recSec.textContent || '').indexOf('我剩 26 张') >= 0, '6.4 显示我的剩余张数');
 
-  /* ── 7. 控制器：非房主 + 自动开局预设 ── */
-  group('7. 控制器（我不是房主）');
-
-  const store = {};
-  const win = makeWin(store);
-  const rawGd = makeGdDeal(202);
-  const table = makeTable(rawGd, 2, 4);
-  const ctl = DGSite.create({
-    DG: DG, DGUi: DGUi, HQ: table.HQ, document: table.doc, window: win
-  });
-  ctl.start();
-
-  ok(!!ctl.getUi(), '7.1 面板建起来了');
-  ok(ctl.read().mySeat === 2, '7.2 读到我的座位 = 2');
-  ok(table.props.room.owner === 99, '7.3 房主是别人（99），我不是房主');
-  ok(ctl.isNewRound() === true, '7.4 判定为「刚发完牌」');
-
-  ctl.setDeal({ cards: [53, 54, 107, 108], auto: true, delay: 0 });
-  ok(store['dg.deal'] != null, '7.5 预设写进 localStorage');
-  eq(JSON.parse(store['dg.deal']).cards, [53, 54, 107, 108], '7.6 localStorage 里是这四张王');
-
-  await wait(420);      // tick(200ms) + setTimeout(0) + 校验轮询(60ms)
-
-  const forgedMsgs = table.sent.filter(function (m) { return m.key === 0; });
-  ok(forgedMsgs.length >= 1, '7.7 自动发了一条 PlayerUpdateGameData（key=0）');
-
-  const after = DG.expand(DG.decodeGameData(table.props.game.data), { seats: 4 });
-  const mine = after.hands[2] || [];
-  eq([53, 54, 107, 108].filter(function (c) { return mine.indexOf(c) >= 0 }), [53, 54, 107, 108],
-    '7.8 四张王已经在我手上');
-  eq([1, 2, 3, 4].map(function (s) { return after.counts[s]; }), [27, 27, 27, 27],
-    '7.9 四家张数仍然 27/27/27/27（张数守恒）');
-  ok(after.rule === 2 && after.state === 1, '7.10 rule / state 没被动过');
-  ok(ctl.read().view.played.length === 0, '7.11 没伪造出牌');
-
-  /* ── 8. 不重复触发 ── */
-  group('8. 幂等');
-
-  const n1 = table.sent.length;
-  await wait(360);
-  eq(table.sent.length, n1, '8.1 同一局不会反复发消息（预设已满足就停手）');
-
-  const dealSatisfiedNow = ctl.getDeal();
-  eq(dealSatisfiedNow.auto, true, '8.2 自动开关还开着');
-  ok(ctl.isNewRound() === true, '8.3 仍然处于「开局」状态（只是牌已经换好了）');
-
-  /* ── 9. 出过牌就不再算新局 ── */
-  group('9. 局中不再触发');
-
-  const rawMid = makeGdDeal(303);
-  const mid0 = DG.expand(rawMid, { seats: 4 });
-  const playedThree = (mid0.hands[1] || []).slice(0, 3);       // 让 1 号先出三张，牌局才自洽
-  playedThree.forEach(function (c) { rawMid.cardPositionList[c - 1] = 0; });
-  rawMid.playedCardList = [0].concat(playedThree);
-  rawMid.state = 2;
-  const expectMid = [24, 27, 27, 27];
-  const table2 = makeTable(rawMid, 2, 4);
-  const ctl2 = DGSite.create({
-    DG: DG, DGUi: DGUi, HQ: table2.HQ, document: table2.doc, window: makeWin({})
-  });
-  ctl2.start();
-  ok(ctl2.isNewRound() === false, '9.1 已经出过牌 → 不是新局');
-  ctl2.setDeal({ cards: [53, 54], auto: true, delay: 0 });
-  await wait(300);
-  eq(table2.sent.filter(function (m) { return m.key === 0; }).length, 0, '9.2 局中不会自动换牌');
-
-  /* ── 10. 手动换牌在非房主身上照样成立 ── */
-  group('10. 手动换牌');
-
-  table2.sent.length = 0;
-  ctl2.forge([53, 54], false);
-  await wait(260);
-  ok(table2.sent.filter(function (m) { return m.key === 0; }).length >= 1, '10.1 手动换牌发出了 key=0');
-  const mid2 = DG.expand(DG.decodeGameData(table2.props.game.data), { seats: 4 });
-  eq([53, 54].filter(function (c) { return (mid2.hands[2] || []).indexOf(c) >= 0 }), [53, 54], '10.2 两张王到手');
-  eq([1, 2, 3, 4].map(function (s) { return mid2.counts[s]; }), expectMid, '10.3 张数依旧守恒（含已出的 3 张）');
-
-  /* ── 11. 斗地主（3 人）也能用 ── */
-  group('11. 斗地主');
-
-  const rawDdz = makeDdzDeal(404);
-  const table3 = makeTable(rawDdz, 1, 3);
-  const ctl3 = DGSite.create({
-    DG: DG, DGUi: DGUi, HQ: table3.HQ, document: table3.doc, window: makeWin({})
-  });
-  ctl3.start();
-  eq(ctl3.read().kind, 'ddz', '11.1 认成斗地主');
-  ctl3.forge([53, 54], false);
-  await wait(260);
-  const ddz2 = DG.expand(DG.decodeGameData(table3.props.game.data), { seats: 3 });
-  eq([53, 54].filter(function (c) { return (ddz2.hands[1] || []).indexOf(c) >= 0 }), [53, 54], '11.2 王炸到手');
-  eq([1, 2, 3].map(function (s) { return ddz2.counts[s]; }), [17, 17, 17], '11.3 三家 17 张不变');
-  eq(ddz2.holes.length, 3, '11.4 底牌还是 3 张');
-
+  group('7. 旧存档不会触发开局换牌');
+  const store={'dg.deal':JSON.stringify({cards:[53,54,107,108],auto:true,delay:0})};
+  const rawGd=makeGdDeal(202);
+  const table=makeTable(rawGd,2,4);
+  const ctl=DGSite.create({DG,DGUi,HQ:table.HQ,document:table.doc,window:makeWin(store)});
+  ctl.start();await wait(300);
+  eq(table.sent.length,0,'旧自动配置不会发改牌消息');
+  eq(ctl.getDeal().auto,false,'旧自动配置载入时停用');
+  ctl.setDeal({cards:[53,54],auto:true,delay:0});await wait(260);
+  eq(table.sent.length,0,'程序调用开关也不会自动发改牌消息');
+  const before=DG.decodeGameData(table.props.game.data);
+  ctl.forge([53,54],false,{give:DG.expand(before).hands[2].slice(0,2)});
+  eq(table.sent.length,0,'无已出牌时阻止从持有人取牌');
+  ok(DG.rawEqual(before,DG.decodeGameData(table.props.game.data)),'开局牌局原样保留');
   /* ── 收尾 ── */
   ctl.stop();
-  ctl2.stop();
-  ctl3.stop();
+
 
   console.log('\n────────────────────────────────────────');
   console.log('  通过 ' + pass + ' / ' + (pass + fail));

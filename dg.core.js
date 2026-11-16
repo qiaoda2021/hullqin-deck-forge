@@ -20,13 +20,15 @@
  * CAS 与字节数上限校验，不校验牌面归属 → 任何玩家都能改写「谁有什么牌」。
  */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.DG = api;
-})(typeof self !== 'undefined' ? self : globalThis, function () {
+})(typeof self !== 'undefined' ? self : globalThis, function (root) {
   'use strict';
 
   const VERSION = '1.0.0';
+  const GD = typeof module !== 'undefined' && module.exports ? require('./vendor/gd.site.core.js') : root.GDSite;
+  const DDZ = typeof module !== 'undefined' && module.exports ? require('./vendor/ddz.core.js') : root.DDZEngine;
 
   /** cardPositionList 的低 3 位 = 归属座位（1..N，7 = 无主） */
   const SEAT_MASK = 7;
@@ -263,298 +265,195 @@
 
   /* ════════════════════════════════ 换牌 ════════════════════════════════ */
 
-  /**
-   * 给某个 donor 挑一张「送出去最不亏」的牌。
-   * 规则：先在我最差的 3 张里挑，再优先挑 donor 手里同点数张数多的那张
-   *      （他拿到后能凑对/凑炸，主观上不会觉得牌被别人动过）。
-   */
-  function pickGive(giveable, donor, view, rng) {
-    if (!giveable.length) return 0;
-    const sorted = giveable.slice().sort(function (a, b) {
-      const wa = cardWeight(a) + (isJoker(a) ? 100 : 0);
-      const wb = cardWeight(b) + (isJoker(b) ? 100 : 0);
-      if (wa !== wb) return wa - wb;
-      return a - b;
+  /** 已出牌必须同时出现在流水中、且当前不属于任何座位；无主暗池不是已出牌。 */
+  function playedPool(raw, opts) {
+    const v = expand(raw, opts);
+    return uniqNums(v.played).filter(function (id) {
+      return id <= v.total && (Number(raw.cardPositionList[id - 1]) & SEAT_MASK) === 0;
     });
-    const pool = sorted.slice(0, Math.min(3, sorted.length));
-    const donorRanks = rankCounts(view.hands[donor] || []);
-    let best = pool[0];
-    let bestScore = -1;
-    pool.forEach(function (c) {
-      const same = donorRanks[rankOf(c)] || 0;      // donor 已有几张这个点数
-      const score = same * 10 + (4 - pool.indexOf(c));
-      if (score > bestScore) { bestScore = score; best = c; }
-    });
-    return best;
-  }
-
-  /**
-   * 计算换牌方案（纯计算，不发消息、不改入参）。
-   *
-   * @param {object} raw      当前 DDZGameData
-   * @param {number[]} want   想拿到手上的牌（1..total 的 id）
-   * @param {object} opts
-   *   @param {number} opts.mySeat     我的座位（room.position，1 基）
-   *   @param {number} [opts.seats]    座位数
-   *   @param {boolean} [opts.allowHole] 是否允许动底牌（会显示归属，默认关）
-   *   @param {boolean} [opts.preferPool] 优先用无主暗池（默认开）
-   * @returns {object} plan
-   */
-  function plan(raw, want, opts) {
-    const o = opts || {};
-    const mySeat = Math.floor(Number(o.mySeat) || 0);
-    const view = expand(raw, { seats: o.seats });
-    const notes = [];
-    const problems = [];
-
-    if (!mySeat || mySeat < 1 || mySeat > view.seats) {
-      return fail(view, '读不到我的座位（room.position），请先入座');
-    }
-
-    const mine = view.hands[mySeat].slice();
-    const mineSet = new Set(mine);
-    const wantList = uniqNums(want).filter(function (id) { return id <= view.total; });
-    if (!wantList.length) {
-      return Object.assign(fail(view, ''), { ok: true, noop: true, changes: [], gained: [], given: [], donors: [] });
-    }
-
-    const wantSet = new Set(wantList);
-    const holeSet = new Set(view.holes);
-    const changes = [];
-    const gained = [];
-    const given = [];
-    const donors = new Map();
-    const blocked = [];
-    const giveable = mine.filter(function (c) { return !wantSet.has(c); });
-    let freeGain = 0;
-    let swapGain = 0;
-    let twinGain = 0;
-
-    // donor 挑选顺序：手牌多的先（他更难数清），再按座位号
-    const donorOrder = [];
-    for (let s = 1; s <= view.seats; s++) if (s !== mySeat) donorOrder.push(s);
-    donorOrder.sort(function (a, b) { return (view.counts[b] - view.counts[a]) || (a - b); });
-
-    wantList.forEach(function (card) {
-      if (mineSet.has(card)) { gained.push(card); return; }
-      const owner = view.owners[card] || 0;
-
-      // ① 无主牌：直接拿，零代价（斗地主 2 人局的暗池 / 未认领底牌）
-      if (owner === 0) {
-        if (holeSet.has(card) && !o.allowHole) { blocked.push(card); return; }
-        changes.push({ card: card, from: 0, to: mySeat, role: 'gain' });
-        gained.push(card);
-        freeGain++;
-        return;
-      }
-
-      // ② 等价交换：拿走 donor 的牌，还他一张我的闲牌
-      if (!giveable.length) { blocked.push(card); return; }
-      const give = pickGive(giveable, owner, view);
-      if (!give) { blocked.push(card); return; }
-      giveable.splice(giveable.indexOf(give), 1);
-      changes.push({ card: card, from: owner, to: mySeat, role: 'gain' });
-      changes.push({ card: give, from: mySeat, to: owner, role: 'give' });
-      gained.push(card);
-      given.push(give);
-      const d = donors.get(owner) || { seat: owner, got: [], gave: [] };
-      d.got.push(card);
-      d.gave.push(give);
-      donors.set(owner, d);
-      // 掼蛋两副牌：donor 手上还有同一张牌的另一份 → 他「我有 A」的记忆依然成立
-      const twin = twinOf(card, view.kind);
-      if (twin && twin <= view.total && (view.owners[twin] || 0) === owner) twinGain++;
-      else swapGain++;
-    });
-
-    if (blocked.length && !gained.length) {
-      return fail(view, '目标牌拿不到：' + cardTexts(blocked).join(' ') +
-        (blocked.some(function (c) { return holeSet.has(c); }) ? '（底牌会显示归属，默认不动）' : '（我没有可交换出去的闲牌）'));
-    }
-    if (blocked.length) {
-      notes.push('这些牌跳过：' + cardTexts(blocked).join(' ') + '（底牌归属 / 无闲牌可换）');
-    }
-
-    const planObj = {
-      ok: changes.length > 0 || blocked.length === 0,
-      noop: changes.length === 0,
-      view: view,
-      mySeat: mySeat,
-      want: wantList,
-      gained: gained,
-      given: given,
-      keep: wantList.filter(function (c) { return mineSet.has(c); }),
-      donors: Array.from(donors.values()),
-      changes: changes,
-      risk: riskOf({ freeGain: freeGain, swapGain: swapGain, twinGain: twinGain, donors: Array.from(donors.values()), kind: view.kind }),
-      notes: notes,
-      error: '',
-      stats: { freeGain: freeGain, swapGain: swapGain, twinGain: twinGain, keep: wantList.filter(function (c) { return mineSet.has(c); }).length },
-      summary: ''
-    };
-    planObj.summary = summaryOf(planObj);
-    return planObj;
   }
 
   function fail(view, error) {
+    return { ok: false, noop: false, view: view, error: error, gained: [], given: [], keep: [], changes: [], notes: [], stats: {} };
+  }
+
+  function validIds(cards, total) {
+    return Array.isArray(cards) && cards.every(function (id) { return Number.isInteger(id) && id > 0 && id <= total; }) && new Set(cards).size === cards.length;
+  }
+
+  /** 用换出的牌替代历史中的换入牌，保留动作分隔和牌型；改变牌型则整体中止。 */
+  function exchangeHistory(raw, incoming, outgoing, view) {
+    const map = new Map(incoming.map(function (id, i) { return [id, outgoing[i]]; }));
+    const history = (raw.playedCardList || []).map(function (id) { return map.has(id) ? map.get(id) : id; });
+    const types = (raw.playedTypeList || []).slice();
+    const old = raw.playedCardList || [];
+    if (old.length && old[0] !== 0) throw new Error('出牌流水缺少动作分隔');
+    let segment = -1;
+    let start = 0;
+    for (let i = 0; i <= old.length; i++) {
+      if (i < old.length && old[i] !== 0) continue;
+      if (segment >= 0) {
+        const prev = old.slice(start, i);
+        const next = history.slice(start, i);
+        if (prev.some(function (id) { return map.has(id); })) {
+          if (view.kind === 'gd') {
+            const code = Number(types[segment]) || GD.bestCode(prev, 0, view.level);
+            const candidates = GD.interpretCodes(next, view.level).filter(function (c) { return (c >> 8) === (code >> 8); });
+            if (!candidates.length) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
+            types[segment] = candidates.indexOf(code) >= 0 ? code : candidates[candidates.length - 1];
+          } else {
+            const a = DDZ.parseCards(view.seats < 4, prev);
+            const b = DDZ.parseCards(view.seats < 4, next);
+            if (!a[0] || a[0] !== b[0]) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
+          }
+        }
+        if (next.length) {
+          // 复用站点回放确定当前墩；逐手检查，防止改小前手或改大后被压牌。
+          const prefix = history.slice(0, start - 1);
+          let legal;
+          if (view.kind === 'gd') {
+            const rep = GD.replayActions(prefix, raw.firstPlayer || 1, types);
+            const prevCode = rep.lastInterp || GD.bestCode(rep.lastCards, 0, view.level);
+            const code = Number(types[segment]) || GD.bestCode(next, 0, view.level);
+            legal = GD.interpretCodes(next, view.level).indexOf(code) >= 0 && GD.beats(code, prevCode);
+          } else {
+            const rep = DDZ.expandState(Object.assign({}, raw, { playedCardList: prefix }), view.seats);
+            legal = DDZ.canBeat(view.seats < 4, next, rep.lastCards);
+          }
+          if (!legal) throw new Error('第 ' + (segment + 1) + ' 手不符合牌型或连续压牌关系，请调整换出牌');
+        }
+      }
+      if (i < old.length) { segment++; start = i + 1; }
+    }
+    return { cards: history, types: types };
+  }
+
+  /** 只从已出牌换入；换出的每张牌都由调用方显式选择。失败不生成部分方案。 */
+  function plan(raw, want, opts) {
+    const o = opts || {};
+    const v = expand(raw, o);
+    const seat = Number(o.mySeat);
+    if (!Number.isInteger(seat) || seat < 1 || seat > v.seats) return fail(v, '请先入座');
+    if (v.phase !== 'play') return fail(v, '只在出牌阶段交换');
+    const give = o.give || [];
+    if (!validIds(want, v.total) || !validIds(give, v.total)) return fail(v, '牌 ID 越界、重复或格式错误');
+    if (!want.length && !give.length) return Object.assign(fail(v, ''), { ok: true, noop: true });
+    const pool = new Set(playedPool(raw, o));
+    if (want.some(function (id) { return !pool.has(id); })) return fail(v, '换入只能选已打出的牌，其他人的手牌、底牌和暗池均不参与');
+    if (give.some(function (id) { return v.hands[seat].indexOf(id) < 0; })) return fail(v, '换出只能选我当前的手牌');
+    if (want.length !== give.length) return fail(v, '请选择等量换出牌：换入 ' + want.length + ' 张 / 换出 ' + give.length + ' 张');
+    if (!want.length) return fail(v, '请先选择已出牌');
+    if (want.some(function (id) { return v.played.filter(function (c) { return c === id; }).length !== 1; })) return fail(v, '出牌记录存在重复牌，已中止交换');
+    let history;
+    try { history = exchangeHistory(raw, want, give, v); } catch (e) { return fail(v, e.message); }
+    const changes = [];
+    want.forEach(function (id, i) {
+      changes.push({ card: id, from: 0, to: seat, role: 'gain' });
+      changes.push({ card: give[i], from: seat, to: 0, role: 'give' });
+    });
     return {
-      ok: false, noop: false, error: error || '', view: view,
-      mySeat: 0, want: [], gained: [], given: [], keep: [], donors: [], changes: [],
-      risk: { level: 'unknown', score: 0, text: '—', reasons: [] }, notes: [], stats: {}, summary: ''
+      ok: true, noop: false, view: v, mySeat: seat, gained: want.slice(), given: give.slice(), keep: [], changes: changes,
+      history: history.cards, types: history.types, originalTypes: (raw.playedTypeList || []).slice(),
+      notes: ['仅交换已出牌与我的手牌；对应历史牌面会替换为换出牌，其他人的在手牌保持不变。'],
+      stats: { swapGain: want.length }, summary: '换入 ' + cardTexts(want).join(' ') + '；换出 ' + cardTexts(give).join(' ')
     };
   }
 
-  /**
-   * 隐蔽性评分：
-   *   none   —— 只动了无主暗池 / 掼蛋的重复副本，没有任何人能「数出来」
-   *   low    —— 等价交换，且补给他的牌能凑上他已有的点数
-   *   medium —— 等价交换，但他手上原来没有这个点数（可能想起「我摸过这张」）
-   */
-  function riskOf(st) {
-    const reasons = [];
-    let score = 0;
-    if (st.freeGain) { reasons.push('无主暗池 ' + st.freeGain + ' 张（全桌都看不到这些牌）'); }
-    if (st.twinGain) { score += 1; reasons.push('取的是他手上的重复副本 ' + st.twinGain + ' 张（掼蛋两副牌，他「有这张」的记忆不变）'); }
-    if (st.swapGain) { score += 3; reasons.push('等价交换 ' + st.swapGain + ' 张（张数守恒，但被他逐帧比对时能看出）'); }
-    st.donors.forEach(function (d) {
-      const ranks = rankCounts(d.gave);
-      Object.keys(ranks).forEach(function (r) { reasons.push('座位 ' + d.seat + ' 收到 ' + d.gave.map(cardText).join(' ') + '（凑 ' + rankText(Number(r)) + '）'); });
-    });
-    let level = 'none';
-    if (score >= 3) level = 'medium';
-    else if (score >= 1) level = 'low';
-    if (st.freeGain && !score) level = 'none';
-    const text = level === 'none' ? '无痕' : (level === 'low' ? '低' : '中');
-    return { level: level, score: score, text: text, reasons: reasons };
-  }
-
-  function summaryOf(p) {
-    const bits = [];
-    if (p.gained.length) bits.push('得到 ' + cardTexts(p.gained).join(' '));
-    if (p.given.length) bits.push('送出 ' + cardTexts(p.given).join(' '));
-    if (!p.changes.length) return '无需改动';
-    return bits.join('；');
-  }
-
-  /** 把 plan 应用到 raw，返回新的 raw（深拷贝相关字段，其余原样带上） */
-  function applyPlan(raw, planObj) {
+  function applyPlan(raw, p) {
+    if (!p || !p.ok) throw new Error('仅可应用通过校验的换牌方案');
     const out = {};
-    Object.keys(raw || {}).forEach(function (k) {
-      const v = raw[k];
-      out[k] = Array.isArray(v) ? v.slice() : v;
+    Object.keys(raw).forEach(function (k) { out[k] = Array.isArray(raw[k]) ? raw[k].slice() : raw[k]; });
+    (p.changes || []).forEach(function (ch) {
+      out.cardPositionList[ch.card - 1] = (Number(out.cardPositionList[ch.card - 1]) & ~SEAT_MASK) | ch.to;
     });
-    const cpl = Array.isArray(raw.cardPositionList) ? raw.cardPositionList.map(Number) : [];
-    (planObj.changes || []).forEach(function (ch) {
-      const idx = ch.card - 1;
-      if (idx < 0) return;
-      const hole = (Number(cpl[idx]) || 0) & HOLE_BIT;   // 底牌标记跟着牌走
-      cpl[idx] = (ch.to & SEAT_MASK) | hole;
-    });
-    out.cardPositionList = cpl;
+    if (p.history) out.playedCardList = p.history.slice();
+    if (p.types) out.playedTypeList = p.types.slice();
     return out;
   }
 
-  /** 反向应用（出牌失败时回滚） */
-  function revertPlan(raw, planObj) {
-    return applyPlan(raw, { changes: (planObj.changes || []).map(function (ch) {
-      return { card: ch.card, to: ch.from };
-    }) });
+  function revertPlan(raw, p) {
+    const v = expand(raw, { seats: p.view.seats });
+    const hist = exchangeHistory(raw, p.given, p.gained, v);
+    return applyPlan(raw, { ok: true, changes: p.changes.map(function (ch) { return { card: ch.card, to: ch.from }; }), history: hist.cards, types: p.originalTypes || hist.types });
   }
 
-  /* ════════════════════════════════ 自洽性审计 ════════════════════════════════ */
-
-  const FROZEN_FIELDS = ['rule', 'state', 'landlordId', 'playedCardList', 'v', 'team13Level',
-    'team24Level', 'lastRankList', 'tributeCardList', 'returnCardList', 'firstPlayer', 'playedTypeList'];
-
-  /**
-   * 审计一次改动是否「自洽」——即：任何只读状态、不做历史比对的对手都看不出异常。
-   * 这是换牌能不能用的硬门槛，UI 上每次预览都会跑一遍。
-   * @param {object} before 改前 raw
-   * @param {object} after  改后 raw
-   * @param {{seats?:number}} [opts]
-   * @returns {{ok:boolean, problems:string[], touched:number[], countsSame:boolean}}
-   */
+  /** 独立重建允许的变更；旧 allowPool / allowHole 参数不再放行任何旁路。 */
   function audit(before, after, opts) {
     const o = opts || {};
-    const problems = [];
     const a = expand(before, o);
     const b = expand(after, o);
-    const allowPool = !!(o.allowPool || o.pool);
-
-    if (a.cplLength !== b.cplLength) problems.push('cardPositionList 长度变了（' + a.cplLength + ' → ' + b.cplLength + '）');
-    if (b.cplLength !== b.total) problems.push('cardPositionList 长度 ' + b.cplLength + ' ≠ 全副牌 ' + b.total + ' 张');
-
-    // ── 张数账本：允许「从无主暗池取牌」时，增加量必须正好等于暗池减少量 ──
-    const holeSetA = new Set(a.holes);
-    const poolA = a.unowned.filter(function (c) { return !holeSetA.has(c); });
-    const holeSetB = new Set(b.holes);
-    const poolB = b.unowned.filter(function (c) { return !holeSetB.has(c); });
-    const poolTaken = poolA.length - poolB.length;   // >0 表示有人从暗池里拿走了牌
-
-    let gained = 0;
-    let lost = 0;
-    const diff = [];
-    for (let s = 1; s <= a.seats; s++) {
-      const d = b.counts[s] - a.counts[s];
-      if (d > 0) gained += d; else if (d < 0) lost -= d;
-      if (d !== 0) diff.push(s + '号 ' + a.counts[s] + '→' + b.counts[s]);
-    }
-    const countsSame = gained === 0 && lost === 0;
-
-    if (!countsSame) {
-      if (!allowPool) {
-        problems.push('手牌张数变了（' + diff.join('，') + '）');
-      } else if (poolTaken < 0) {
-        problems.push('无主暗池凭空多出 ' + (-poolTaken) + ' 张牌');
-      } else if (gained - lost !== poolTaken) {
-        problems.push('张数账不平（手牌 +' + gained + ' −' + lost + '，暗池 −' + poolTaken + '）');
-      }
-    }
-    // 没有主动放行暗池，却出现了暗池减少 → 是「从别人不知道的地方偷牌」
-    if (!allowPool && poolTaken !== 0) {
-      problems.push('无主区被动了 ' + Math.abs(poolTaken) + ' 张（未开启暗池）');
-    }
-
-    // 冻结字段：换牌不该碰它们
-    FROZEN_FIELDS.forEach(function (k) {
-      const x = JSON.stringify(before && before[k] !== undefined ? before[k] : null);
-      const y = JSON.stringify(after && after[k] !== undefined ? after[k] : null);
-      if (x !== y) problems.push('字段 ' + k + ' 被改动');
-    });
-
-    // 张数上限（发牌时每人不超 handSize；开启暗池时允许多出取走的暗池数）
-    const capBonus = allowPool ? Math.max(0, poolTaken) : 0;
-    for (let s = 1; s <= a.seats; s++) {
-      if (b.counts[s] > a.handSize + capBonus && b.counts[s] > a.counts[s]) {
-        problems.push(s + '号手牌 ' + b.counts[s] + ' 张，超过发牌张数 ' + (a.handSize + capBonus));
-      }
-    }
-
-    // 已出过的牌不能又回到任何人手上（否则同一张牌会在桌面与手牌同时出现）
-    const playedSet = new Set(b.played);
-    let dup = 0;
-    for (let s = 1; s <= b.seats; s++) {
-      b.hands[s].forEach(function (c) { if (playedSet.has(c)) dup++; });
-    }
-    if (dup) problems.push('有 ' + dup + ' 张已打出的牌又出现在手牌里');
-
-    // 底牌标记不能被无故改动
-    const holeA = a.holes.slice().sort(function (x, y) { return x - y; }).join(',');
-    const holeB = b.holes.slice().sort(function (x, y) { return x - y; }).join(',');
-    if (holeA !== holeB) problems.push('底牌标记被改动');
-
+    const problems = [];
     const touched = [];
-    const cplA = before && before.cardPositionList || [];
-    const cplB = after && after.cardPositionList || [];
-    const n = Math.min(cplA.length, cplB.length);
-    for (let i = 0; i < n; i++) {
-      if ((Number(cplA[i]) || 0) !== (Number(cplB[i]) || 0)) touched.push(i + 1);
+    const seats = new Set();
+    const incoming = [];
+    const outgoing = [];
+    for (let i = 0; i < a.total; i++) {
+      const x = Number(before.cardPositionList[i]);
+      const y = Number(after.cardPositionList[i]);
+      if (x === y) continue;
+      touched.push(i + 1);
+      const from = x & SEAT_MASK;
+      const to = y & SEAT_MASK;
+      if ((x & ~SEAT_MASK) !== (y & ~SEAT_MASK)) problems.push('底牌标记或高位被改动');
+      if (from === 0 && to >= 1 && to <= a.seats) { incoming.push(i + 1); seats.add(to); }
+      else if (to === 0 && from >= 1 && from <= a.seats) { outgoing.push(i + 1); seats.add(from); }
+      else problems.push('存在场上座位之间或暗池的换牌');
     }
-    if (!allowPool && touched.length && touched.length % 2 !== 0) {
-      problems.push('改动张数为奇数（' + touched.length + '），不可能同时满足两个座位张数守恒');
+    const countsSame = Array.from({ length: a.seats }, function (_, i) { return a.counts[i + 1] === b.counts[i + 1]; }).every(Boolean);
+    if (!countsSame) problems.push('手牌张数不守恒');
+    if (a.cplLength !== b.cplLength || b.cplLength !== a.total) problems.push('cardPositionList 长度不匹配');
+    const seat = Number(o.mySeat) || Array.from(seats)[0];
+    if (seats.size > 1 || (seats.size && !seats.has(seat))) problems.push('改动了其他人的在手牌');
+    if (incoming.length !== outgoing.length) problems.push('换入和换出张数不同');
+    const beforeHistory = before.playedCardList || [];
+    const afterHistory = after.playedCardList || [];
+    // 按流水位置恢复配对，避免排序不同导致审计与用户选择错位。
+    const pairedOut = incoming.map(function (id) { return afterHistory[beforeHistory.indexOf(id)]; });
+    if (pairedOut.some(function (id) { return outgoing.indexOf(id) < 0; }) || new Set(pairedOut).size !== pairedOut.length) problems.push('出牌记录未按换出牌替换');
+    let expected = before;
+    if (incoming.length && !problems.length) {
+      const p = plan(before, incoming, { mySeat: seat, seats: a.seats, give: pairedOut });
+      if (!p.ok) problems.push(p.error);
+      else expected = applyPlan(before, p);
     }
+    Object.keys(PROTO_FIELDS).forEach(function (k) {
+      if (JSON.stringify(after[k] == null ? null : after[k]) !== JSON.stringify(expected[k] == null ? null : expected[k])) problems.push('字段 ' + k + ' 不符合交换方案');
+    });
+    const seen = new Set();
+    b.played.forEach(function (id) {
+      if (id > b.total || seen.has(id) || b.owners[id]) problems.push('已打出牌重复、越界或仍在手牌中');
+      seen.add(id);
+    });
+    return { ok: !problems.length, problems: problems, touched: touched, countsSame: countsSame, poolTaken: 0 };
+  }
 
-    return { ok: problems.length === 0, problems: problems, touched: touched, countsSame: countsSame, poolTaken: poolTaken };
+  /** 优先完整炸弹，再同花顺；组之间不重复占用同一物理牌。 */
+  function handGroups(hand, kind, level, seats) {
+    const cards = sortHand(hand);
+    let combos = [];
+    if (kind === 'gd') {
+      combos = GD.genMoves(cards, level, 0).filter(function (p) { return p.bomb > 0; }).map(function (p) {
+        return { cards: p.cards, kind: p.type === GD.TYPE.StraightFlush ? 'flush' : 'bomb', label: p.name, weight: p.bomb };
+      });
+    } else {
+      const ranks = {};
+      cards.forEach(function (id) { (ranks[rankOf(id)] || (ranks[rankOf(id)] = [])).push(id); });
+      Object.keys(ranks).forEach(function (r) { if (ranks[r].length >= 4) combos.push({ cards: ranks[r], kind: 'bomb', label: ranks[r].length + '张炸弹', weight: ranks[r].length }); });
+      const jokers = cards.filter(isJoker);
+      if (DDZ.parseCards(Number(seats) < 4 || !seats, jokers)[0] === DDZ.Jokers) combos.push({ cards: jokers, kind: 'bomb', label: '王炸', weight: 99 });
+    }
+    combos.sort(function (a, b) { return b.weight - a.weight || b.cards.length - a.cards.length || b.cards[0] - a.cards[0]; });
+    const used = new Set();
+    const out = [];
+    combos.forEach(function (p) {
+      if (p.cards.some(function (id) { return used.has(id); })) return;
+      p.cards.forEach(function (id) { used.add(id); });
+      out.push(p);
+    });
+    const ranks = {};
+    cards.forEach(function (id) { if (!used.has(id)) (ranks[rankOf(id)] || (ranks[rankOf(id)] = [])).push(id); });
+    Object.keys(ranks).map(Number).sort(function (a, b) { return b - a; }).forEach(function (r) { out.push({ cards: ranks[r], kind: 'rank', label: '' }); });
+    return out;
   }
 
   /* ════════════════════════════════ 预设牌型 ════════════════════════════════ */
@@ -834,6 +733,8 @@
     seatName: seatName,
     sortHand: sortHand,
 
+    playedPool: playedPool,
+    handGroups: handGroups,
     plan: plan,
     applyPlan: applyPlan,
     revertPlan: revertPlan,

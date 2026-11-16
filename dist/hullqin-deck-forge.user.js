@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         控牌助手（斗地主 / 掼蛋）
 // @namespace    hullqin-deck-forge
-// @version      2.1.0
-// @description  斗地主 / 掼蛋 一体化牌局助手：👁 四家透视 · 🃏 记牌器 · 🤖 AI 出牌建议与托管 · 🎯 自选目标牌 · 🔁 等价交换换牌 · 🎬 开局预设（每局发牌瞬间就变成你要的牌）。走页面自带的 PlayerUpdateGameData 通道，非房主可用；每次改动前后自动自检，手牌张数守恒、别人的牌局始终自洽。仅供朋友间娱乐。
+// @version      2.2.0
+// @description  斗地主 / 掼蛋 一体化牌局助手：👁 叠牌透视（炸弹 / 同花顺高亮） · 🃏 记牌器 · 🤖 AI 建议与托管 · 🔁 仅从已出牌交换，手选换出手牌，其他人的在手牌保持不变。仅供朋友间娱乐。
 // @author       Eve
 // @match        https://game.hullqin.cn/*
 // @run-at       document-idle
@@ -1812,6 +1812,1181 @@
   };
 });
 
+/* ===== vendor/gd.site.core.js ===== */
+/*!
+ * gd.site.core.js — 掼蛋 AI 助手（game.hullqin.cn 油猴版）· 站点规则引擎
+ *
+ * 规则 1:1 复刻站点掼蛋（rule=2）逻辑（逆向自 ddz chunk module 6135/9474），契约见 SPEC2.md。
+ * 纯逻辑、无 DOM 依赖、不联网；浏览器（全局 GDSite）与 Node（module.exports）通用。
+ */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.GDSite = api;
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  const VERSION = '1.0.0';
+  const TOTAL = 108;
+  const DECKS = 2;
+
+  const SUIT_SYMBOLS = ['♦', '♣', '♥', '♠'];
+
+  const TYPE = {
+    Single: 1,
+    Pair: 2,
+    Triple: 3,
+    ThreeWithPair: 4,
+    Steel: 5,
+    TriplePairs: 6,
+    Straight: 7,
+    Four: 100,
+    Five: 101,
+    StraightFlush: 102,
+    Six: 103,
+    Seven: 104,
+    Eight: 105,
+    FourJokers: 127
+  };
+
+  const TYPE_NAME = {
+    1: '单张', 2: '对子', 3: '三同张', 4: '三带二', 5: '钢板', 6: '三连对', 7: '顺子',
+    100: '炸弹4张', 101: '炸弹5张', 102: '同花顺', 103: '炸弹6张', 104: '炸弹7张', 105: '炸弹8张', 127: '四大天王'
+  };
+
+  const RANK_TEXT = {
+    2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9', 10: '10',
+    11: 'J', 12: 'Q', 13: 'K', 14: 'A', 15: '级牌', 16: '小王', 17: '大王'
+  };
+
+  /* ============================ 牌模型 ============================ */
+
+  function normLevel(level) {
+    const n = Number(level);
+    if (!isFinite(n)) return 2;
+    return Math.min(14, Math.max(2, Math.floor(n)));
+  }
+
+  /** 归一化到 1..54（第一副内的 local id） */
+  function normalizeId(id) {
+    const n = Number(id);
+    if (!isFinite(n)) return 0;
+    return ((Math.floor(n) - 1) % 54 + 54) % 54 + 1;
+  }
+
+  function cardDeck(id) {
+    const n = Number(id);
+    if (!isFinite(n) || n <= 0) return 0;
+    return Math.floor((Math.floor(n) - 1) / 54);
+  }
+
+  function cardLocal(id) {
+    return normalizeId(id);
+  }
+
+  /** 自然点数：2..14，小王16，大王17 */
+  function rankOf(id) {
+    const t = normalizeId(id);
+    if (t === 53) return 17;
+    if (t === 54) return 16;
+    const r = t % 13;
+    return r === 1 ? 14 : (r === 0 ? 13 : r);
+  }
+
+  /** 花色 0=♦ 1=♣ 2=♥ 3=♠；王返回 -1 */
+  function suitOf(id) {
+    const t = normalizeId(id);
+    if (t >= 53) return -1;
+    return Math.floor((t - 1) / 13);
+  }
+
+  function isJoker(id) {
+    return suitOf(id) === -1;
+  }
+
+  function levelOrder(rank, level) {
+    const lv = normLevel(level);
+    return rank === lv ? 15 : rank;
+  }
+
+  function isLevelCard(id, level) {
+    return rankOf(id) === normLevel(level);
+  }
+
+  /** 逢人配：红桃级牌（local 27..39 且自然点数=级牌） */
+  function isWildCard(id, level) {
+    const t = normalizeId(id);
+    return t >= 27 && t <= 39 && rankOf(id) === normLevel(level);
+  }
+
+  function heartLevelId(level) {
+    const lv = normLevel(level);
+    return lv === 14 ? 27 : lv + 26;
+  }
+
+  function rankText(rank) {
+    const n = Number(rank);
+    if (RANK_TEXT[n]) return RANK_TEXT[n];
+    if (isFinite(n)) return String(n);
+    return '?';
+  }
+
+  function cardText(id) {
+    if (isJoker(id)) return rankText(rankOf(id));
+    return SUIT_SYMBOLS[suitOf(id)] + rankText(rankOf(id));
+  }
+
+  function cardTexts(ids) {
+    return (ids || []).map(cardText);
+  }
+
+  /* ============================ 牌型解释 ============================ */
+
+  function countsBy(arr, fn) {
+    const m = new Map();
+    (arr || []).forEach(function (c) {
+      const k = fn(c);
+      m.set(k, (m.get(k) || 0) + 1);
+    });
+    return m;
+  }
+
+  function uniqNumbers(arr) {
+    const out = [];
+    const seen = {};
+    (arr || []).forEach(function (v) {
+      const n = Number(v);
+      if (!isFinite(n) || seen[n]) return;
+      seen[n] = 1;
+      out.push(n);
+    });
+    return out;
+  }
+
+  /**
+   * 解释一组牌的候选牌型 code（等价于站点 module 6135 的 x()）。
+   * @returns {number[]} 去重升序的 code 列表
+   */
+  function interpretCodes(cards, level) {
+    const lv = normLevel(level);
+    const cs = (cards || []).map(Number).filter(function (c) { return c > 0; });
+    const size = cs.length;
+    const out = [];
+    const push = function (code) { out.push(code); };
+    if (!size) return [];
+
+    const wilds = cs.filter(function (c) { return isWildCard(c, lv); });
+    const others = cs.filter(function (c) { return !isWildCard(c, lv); });
+    const u = wilds.length;
+    const cnt = countsBy(others, function (c) { return levelOrder(rankOf(c), lv); });
+    const nat = countsBy(others, function (c) { return rankOf(c); });
+    const keys = Array.from(cnt.keys());
+
+    if (size === 1) {
+      push((TYPE.Single << 8) | (u ? 15 : levelOrder(rankOf(cs[0]), lv)));
+    }
+
+    if (size === 2) {
+      if (u === 2) {
+        push((TYPE.Pair << 8) | 15);
+      } else {
+        keys.forEach(function (e) {
+          if ((u && e >= 16)) return;
+          if (cnt.get(e) === 2 - u) push((TYPE.Pair << 8) | e);
+        });
+      }
+    }
+
+    if (size === 3) {
+      keys.forEach(function (e) {
+        if ((u && e >= 16)) return;
+        if (cnt.get(e) === 3 - u) push((TYPE.Triple << 8) | e);
+      });
+    }
+
+    if (size === 4 && !u && others.every(function (c) { return isJoker(c); })) {
+      push((TYPE.FourJokers << 8) | 0);
+    }
+
+    if (cnt.size <= 1) {
+      const y = others.length ? levelOrder(rankOf(others[0]), lv) : 0;
+      if (!u || y < 16) {
+        for (let x = 4; x <= 8; x++) {
+          if (x - u >= 1 && x - u === others.length) {
+            const t = x <= 5 ? TYPE.Four + x - 4 : x + 97;
+            push((t << 8) | y);
+          }
+        }
+      }
+    }
+
+    if (size === 5) {
+      const g = new Set(others.map(function (c) { return rankOf(c); }));
+      const allDistinct = g.size === others.length;
+      const firstSuit = others.length ? suitOf(others[0]) : -1;
+      const sameSuit = allDistinct && others.length > 0 && others.every(function (c) { return suitOf(c) === firstSuit; });
+      for (let b = 5; b <= 14; b++) {
+        let miss = 0;
+        for (let P = b - 4; P <= b; P++) {
+          if (!g.has(P) && !(P === 1 && b === 5 && g.has(14))) miss += 1;
+        }
+        if (miss === u) {
+          if (allDistinct) push((TYPE.Straight << 8) | b);
+          if (sameSuit) push((TYPE.StraightFlush << 8) | b);
+        }
+      }
+    }
+
+    if (size === 5) {
+      keys.forEach(function (e) {
+        if (u && e >= 16) return;
+        const t = cnt.get(e);
+        keys.forEach(function (i) {
+          if (i === e || t > 3 || cnt.get(i) > 2) return;
+          if (t + cnt.get(i) + u !== 5) return;
+          if (u && i >= 16) return;
+          push((TYPE.ThreeWithPair << 8) | e);
+        });
+      });
+    }
+
+    if (size === 6) {
+      const natKeys = Array.from(nat.keys());
+
+      // 三连对：窗口 [e-2,e-1,e]，e=3 时 A(14) 当 1
+      for (let e = 3; e <= 14; e++) {
+        const win = [e - 2, e - 1, e];
+        const ok = natKeys.every(function (r) {
+          return win.indexOf(r) >= 0 || (r === 14 && e === 3);
+        });
+        if (!ok) continue;
+        let sum = 0;
+        let bad = false;
+        for (let idx = 0; idx < win.length; idx++) {
+          const l = win[idx];
+          const o = nat.get(l) || (l === 1 && e === 3 && nat.get(14)) || 0;
+          if (o > 2) { bad = true; break; }
+          sum += 2 - o;
+        }
+        if (!bad && sum === u) push((TYPE.TriplePairs << 8) | e);
+      }
+
+      // 钢板：窗口 [e-1,e]，e=2 时 A(14) 当 1
+      for (let e = 2; e <= 14; e++) {
+        const win = [e - 1, e];
+        const ok = natKeys.every(function (r) {
+          return win.indexOf(r) >= 0 || (r === 14 && e === 2);
+        });
+        if (!ok) continue;
+        let sum = 0;
+        let bad = false;
+        for (let idx = 0; idx < win.length; idx++) {
+          const l = win[idx];
+          const o = nat.get(l) || (l === 1 && e === 2 && nat.get(14)) || 0;
+          if (o > 3) { bad = true; break; }
+          sum += 3 - o;
+        }
+        if (!bad && sum === u) push((TYPE.Steel << 8) | e);
+      }
+    }
+
+    return uniqNumbers(out).sort(function (a, b) { return a - b; });
+  }
+
+  /** next 能否压 prev（prev=0 表示无上一手） */
+  function beats(nextCode, prevCode) {
+    const n = Number(nextCode) || 0;
+    const p = Number(prevCode) || 0;
+    if (!n) return false;
+    if (!p) return true;
+    const nt = n >> 8;
+    const pt = p >> 8;
+    if (nt === pt) return (n & 255) > (p & 255);
+    return nt >= TYPE.Four && nt > pt;
+  }
+
+  /** 从候选解释中选出最优 code（能压 prevCode 的最大 code；prevCode=0 取最大） */
+  function bestCode(cards, prevCode, level) {
+    const codes = interpretCodes(cards, level);
+    if (!codes.length) return 0;
+    const prev = Number(prevCode) || 0;
+    let best = 0;
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i];
+      if (prev && !beats(c, prev)) continue;
+      if (c > best) best = c;
+    }
+    return best;
+  }
+
+  function bombValue(code) {
+    const t = (Number(code) || 0) >> 8;
+    if (t === TYPE.FourJokers) return 99;
+    if (t === TYPE.StraightFlush) return 5.5;
+    if (t === TYPE.Four) return 4;
+    if (t === TYPE.Five) return 5;
+    if (t === TYPE.Six) return 6;
+    if (t === TYPE.Seven) return 7;
+    if (t === TYPE.Eight) return 8;
+    return 0;
+  }
+
+  function typeName(code) {
+    const t = (Number(code) || 0) >> 8;
+    return TYPE_NAME[t] || '未知牌型';
+  }
+
+  /** 站点同款排序：等级降序 → 相对花色（seat 视角）→ id 升序 */
+  function sortHand(cards, level, seat) {
+    const lv = normLevel(level);
+    const mySeat = (seat === undefined || seat === null || seat < 0) ? -1 : seat;
+    return (cards || []).slice().sort(function (a, b) {
+      const d1 = levelOrder(rankOf(a), lv);
+      const d2 = levelOrder(rankOf(b), lv);
+      if (d1 !== d2) return d2 - d1;
+      if (mySeat >= 0) {
+        const s1 = suitOf(a);
+        const s2 = suitOf(b);
+        const r1 = s1 === -1 ? 4 : (s1 - mySeat + 4) % 4;
+        const r2 = s2 === -1 ? 4 : (s2 - mySeat + 4) % 4;
+        if (r1 !== r2) return r1 - r2;
+      }
+      return a - b;
+    });
+  }
+
+  /**
+   * 用一组牌构造 Play；code 缺省时取最大解释（领出）或自动最优。
+   * @returns {object|null} Play
+   */
+  function playFromCards(cards, level, code) {
+    const lv = normLevel(level);
+    const cs = (cards || []).map(Number).filter(function (c) { return c > 0; });
+    if (!cs.length) return null;
+    const validCodes = interpretCodes(cs, lv);
+    if (!validCodes.length) return null;
+    let c = (code === undefined || code === null) ? 0 : Number(code);
+    if (c) {
+      // 显式指定解读时必须与这组牌的真实解读一致，否则视为非法
+      if (validCodes.indexOf(c) < 0) return null;
+    } else {
+      c = bestCode(cs, 0, lv);
+    }
+    if (!c) return null;
+    const sorted = sortHand(cs, lv);
+    const wilds = sorted.filter(function (x) { return isWildCard(x, lv); })
+      .map(function (x) { return { card: x, asRank: null, asSuit: null }; });
+    return {
+      type: c >> 8,
+      code: c,
+      name: typeName(c),
+      cards: sorted,
+      size: sorted.length,
+      rank: c & 255,
+      bomb: bombValue(c),
+      level: lv,
+      wilds: wilds,
+      desc: typeName(c) + ' ' + cardTexts(sorted).join('')
+    };
+  }
+
+  /* ============================ protobuf DDZGameData ============================ */
+
+  const PROTO_FIELDS = {
+    rule: 1, state: 2, landlordId: 3, cardPositionList: 4, playedCardList: 5, v: 6,
+    team13Level: 7, team24Level: 8, lastRankList: 9, tributeCardList: 10,
+    returnCardList: 11, firstPlayer: 12, playedTypeList: 13
+  };
+
+  const PROTO_DEFAULTS = {
+    rule: 0, state: 0, landlordId: 0, cardPositionList: [], playedCardList: [], v: 0,
+    team13Level: 0, team24Level: 0, lastRankList: [], tributeCardList: [],
+    returnCardList: [], firstPlayer: 0, playedTypeList: []
+  };
+
+  function toBytes(input) {
+    if (!input) return new Uint8Array(0);
+    if (input instanceof Uint8Array) return input;
+    if (typeof ArrayBuffer !== 'undefined' && input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (Array.isArray(input)) return Uint8Array.from(input);
+    if (typeof input === 'string') {
+      try {
+        const bin = (typeof atob === 'function') ? atob(input) : '';
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+      } catch (e) { return new Uint8Array(0); }
+    }
+    if (typeof input === 'object' && typeof input.length === 'number') {
+      return Uint8Array.from(input);
+    }
+    return new Uint8Array(0);
+  }
+
+  /** 解码 protobuf DDZGameData（兼容 packed 与单值 repeated） */
+  function decodeGameData(input) {
+    const bytes = toBytes(input);
+    const out = {};
+    Object.keys(PROTO_DEFAULTS).forEach(function (k) {
+      const v = PROTO_DEFAULTS[k];
+      out[k] = Array.isArray(v) ? v.slice() : v;
+    });
+    let pos = 0;
+    const len = bytes.length;
+
+    function readVarint() {
+      let value = 0;
+      let shift = 0;
+      while (pos < len) {
+        const b = bytes[pos++];
+        value += (b & 0x7f) * Math.pow(2, shift);
+        if ((b & 0x80) === 0) break;
+        shift += 7;
+        if (shift > 56) break;
+      }
+      return value >>> 0;
+    }
+    function skipField(wire) {
+      if (wire === 0) { readVarint(); return; }
+      if (wire === 1) { pos += 8; return; }
+      if (wire === 2) { const l = readVarint(); pos += l; return; }
+      if (wire === 5) { pos += 4; return; }
+      pos = len;
+    }
+    function pushRepeated(field, wire) {
+      if (wire === 2) {
+        const l = readVarint();
+        const end = pos + l;
+        while (pos < end) out[field].push(readVarint());
+      } else {
+        out[field].push(readVarint());
+      }
+    }
+
+    while (pos < len) {
+      const tag = readVarint();
+      if (!tag) break;
+      const field = tag >>> 3;
+      const wire = tag & 7;
+      switch (field) {
+        case 1: out.rule = readVarint(); break;
+        case 2: out.state = readVarint(); break;
+        case 3: out.landlordId = readVarint(); break;
+        case 4: pushRepeated('cardPositionList', wire); break;
+        case 5: pushRepeated('playedCardList', wire); break;
+        case 6: out.v = readVarint(); break;
+        case 7: out.team13Level = readVarint(); break;
+        case 8: out.team24Level = readVarint(); break;
+        case 9: pushRepeated('lastRankList', wire); break;
+        case 10: pushRepeated('tributeCardList', wire); break;
+        case 11: pushRepeated('returnCardList', wire); break;
+        case 12: out.firstPlayer = readVarint(); break;
+        case 13: pushRepeated('playedTypeList', wire); break;
+        default: skipField(wire); break;
+      }
+    }
+    return out;
+  }
+
+  /** 编码为 Uint8Array（测试/夹具用） */
+  function encodeGameData(raw) {
+    const src = raw || {};
+    const buf = [];
+    function writeVarint(v) {
+      let n = Number(v) >>> 0;
+      while (n > 0x7f) {
+        buf.push((n & 0x7f) | 0x80);
+        n >>>= 7;
+      }
+      buf.push(n);
+    }
+    function writeUint(field, v) {
+      if (v === undefined || v === null) return;
+      writeVarint((field << 3) | 0);
+      writeVarint(v);
+    }
+    function writeRepeated(field, arr) {
+      if (!arr || !arr.length) return;
+      writeVarint((field << 3) | 2);
+      const tmp = [];
+      for (let i = 0; i < arr.length; i++) {
+        let n = Number(arr[i]) >>> 0;
+        while (n > 0x7f) { tmp.push((n & 0x7f) | 0x80); n >>>= 7; }
+        tmp.push(n);
+      }
+      writeVarint(tmp.length);
+      for (let i = 0; i < tmp.length; i++) buf.push(tmp[i]);
+    }
+    writeUint(PROTO_FIELDS.rule, src.rule || 0);
+    writeUint(PROTO_FIELDS.state, src.state || 0);
+    writeUint(PROTO_FIELDS.landlordId, src.landlordId || 0);
+    writeRepeated(PROTO_FIELDS.cardPositionList, src.cardPositionList);
+    writeRepeated(PROTO_FIELDS.playedCardList, src.playedCardList);
+    writeUint(PROTO_FIELDS.v, src.v || 0);
+    writeUint(PROTO_FIELDS.team13Level, src.team13Level || 0);
+    writeUint(PROTO_FIELDS.team24Level, src.team24Level || 0);
+    writeRepeated(PROTO_FIELDS.lastRankList, src.lastRankList);
+    writeRepeated(PROTO_FIELDS.tributeCardList, src.tributeCardList);
+    writeRepeated(PROTO_FIELDS.returnCardList, src.returnCardList);
+    writeUint(PROTO_FIELDS.firstPlayer, src.firstPlayer || 0);
+    writeRepeated(PROTO_FIELDS.playedTypeList, src.playedTypeList);
+    return Uint8Array.from(buf);
+  }
+
+  /* ============================ 回放 ============================ */
+
+  function partnerOf(seat) {
+    return seat <= 2 ? seat + 2 : seat - 2;
+  }
+
+  function sameTeam(a, b) {
+    return (Number(a) % 2) === (Number(b) % 2);
+  }
+
+  /**
+   * 回放 playedCardList（站点 module 6135 的 g()）。
+   * playedCardList 中每个「动作」以 0 开头：出牌 [0,...cards]，过牌 [0]。
+   * @returns {object} {rankList,trickOwner,lastCards,lastInterp,lastSegmentPlayer,currentPlayer,trickActions,initialHolders,restCounts,actions}
+   */
+  function replayActions(playedCardList, firstPlayer, playedTypeList) {
+    const e = Array.isArray(playedCardList) ? playedCardList : [];
+    const r = Array.isArray(playedTypeList) ? playedTypeList : [];
+    const initialHolders = new Array(TOTAL).fill(0);
+    const restCounts = [0, 27, 27, 27, 27];
+    const finished = [false, false, false, false, false];
+    const rankList = [];
+    const passedSet = new Set();
+    const trickActions = [null, null, null, null, null];
+    const actions = [];
+
+    let trickOwner = 0;
+    let lastCards = [];
+    let lastInterp = 0;
+    let lastSegmentPlayer = 0;
+
+    // 每个动作以 0 开始：动作 k 的 cards = e[zeros[k]+1 .. zeros[k+1]-1]（末尾可无 0）
+    const zeros = [];
+    for (let i = 0; i < e.length; i++) if (!e[i]) zeros.push(i);
+
+    let current = Number(firstPlayer) || 1;
+    if (current < 1 || current > 4) current = 1;
+
+    function nextActive(seat) {
+      let t = seat % 4 + 1;
+      for (let k = 0; k < 4; k++) {
+        if (!finished[t]) return t;
+        t = t % 4 + 1;
+      }
+      return t;
+    }
+
+    for (let seg = 0; seg < zeros.length; seg++) {
+      const start = zeros[seg] + 1;
+      const end = (seg + 1 < zeros.length) ? zeros[seg + 1] : e.length;
+      const cards = e.slice(start, end);
+      const seat = current;
+      lastSegmentPlayer = seat;
+
+      if (cards.length) {
+        cards.forEach(function (c) {
+          const id = Number(c);
+          if (id >= 1 && id <= TOTAL) initialHolders[id - 1] = seat;
+        });
+        restCounts[seat] -= cards.length;
+        if (restCounts[seat] <= 0 && !finished[seat]) {
+          finished[seat] = true;
+          rankList.push(seat);
+        }
+        trickOwner = seat;
+        lastCards = cards.slice();
+        lastInterp = Number(r[seg]) || 0;
+        passedSet.clear();
+        for (let L = 1; L <= 4; L++) {
+          if (L !== seat && finished[L] && trickActions[L] && trickActions[L].cards) trickActions[L] = null;
+        }
+        trickActions[seat] = { cards: cards.slice(), passed: false };
+        actions.push({ seat: seat, cards: cards.slice(), code: lastInterp, passed: false });
+        current = nextActive(seat);
+      } else {
+        passedSet.add(seat);
+        const nx = nextActive(seat);
+        if (trickOwner && (nx === trickOwner || passedSet.has(nx))) {
+          const h = trickOwner;
+          trickActions[seat] = { cards: null, passed: true };
+          for (let w = 1; w <= 4; w++) {
+            if (finished[w] && trickActions[w] && trickActions[w].cards) trickActions[w] = null;
+          }
+          trickOwner = 0;
+          lastCards = [];
+          lastInterp = 0;
+          passedSet.clear();
+          actions.push({ seat: seat, cards: [], code: 0, passed: true });
+          current = finished[h] ? partnerOf(h) : h;
+        } else {
+          trickActions[seat] = { cards: null, passed: true };
+          actions.push({ seat: seat, cards: [], code: 0, passed: true });
+          current = nx;
+        }
+      }
+    }
+
+    return {
+      rankList: rankList,
+      trickOwner: trickOwner,
+      lastCards: lastCards,
+      lastInterp: lastInterp,
+      lastSegmentPlayer: lastSegmentPlayer,
+      currentPlayer: current,
+      trickActions: trickActions,
+      initialHolders: initialHolders,
+      restCounts: restCounts,
+      actions: actions
+    };
+  }
+
+  /* ============================ expandState ============================ */
+
+  function tributeRoles(lastRankList) {
+    const l = Array.isArray(lastRankList) ? lastRankList : [];
+    if (l.length !== 4) return { tributers: [], receivers: [] };
+    const t = l[0];
+    const r = l[1];
+    const n = l[2];
+    const i = l[3];
+    if (sameTeam(t, r)) return { tributers: [n, i], receivers: [t, r] };
+    return { tributers: [i], receivers: [t] };
+  }
+
+  function roundResultOf(rankList, team13Level, team24Level, level, playingTeam) {
+    const list = Array.isArray(rankList) ? rankList : [];
+    if (!list.length) return null;
+    const winTeam = list[0] % 2 === 1 ? 1 : 2;
+    const full = list.slice();
+    [1, 2, 3, 4].forEach(function (s) { if (list.indexOf(s) < 0) full.push(s); });
+    let o = -1;
+    for (let i = 1; i < full.length; i++) {
+      if (sameTeam(full[i], full[0])) { o = i; break; }
+    }
+    const up = o === 1 ? 3 : (o === 2 ? 2 : 1);
+    const t13 = Number(team13Level) || 2;
+    const t24 = Number(team24Level) || 2;
+    return {
+      winTeam: winTeam,
+      playingTeam: playingTeam,
+      upLevels: up,
+      newTeam13Level: winTeam === 1 ? Math.min(14, t13 + up) : t13,
+      newTeam24Level: winTeam === 2 ? Math.min(14, t24 + up) : t24,
+      isMatchOver: level === 14 && winTeam === playingTeam && o !== 3,
+      fullRankList: full
+    };
+  }
+
+  /**
+   * 从原始 protobuf 对象展开派生状态（站点 module 6135 的 C() 等价实现）。
+   * 不修改入参。
+   */
+  function expandState(raw) {
+    const src = raw || {};
+    const e = {};
+    ['rule', 'state', 'landlordId', 'v', 'team13Level', 'team24Level', 'firstPlayer'].forEach(function (k) {
+      e[k] = Number(src[k]) || 0;
+    });
+    ['cardPositionList', 'playedCardList', 'lastRankList', 'tributeCardList', 'returnCardList', 'playedTypeList'].forEach(function (k) {
+      e[k] = Array.isArray(src[k]) ? src[k].slice() : [];
+    });
+
+    const lvList = e.lastRankList;
+    e.level = lvList.length === 4 ? (lvList[0] % 2 === 1 ? (e.team13Level || 2) : (e.team24Level || 2)) : 2;
+    e.playingTeam = lvList.length === 4 ? (lvList[0] % 2 === 1 ? 1 : 2) : 0;
+    e.heartLevelCardId = e.level === 14 ? 27 : e.level + 26;
+
+    const roles = tributeRoles(lvList);
+    e.tributers = roles.tributers;
+    e.receivers = roles.receivers;
+    e.tributeReceivers = (e.tributeCardList.length === roles.tributers.length && roles.tributers.length)
+      ? roles.receivers.slice() : [];
+
+    e.isRoundFinish = e.state > 8;
+    e.phase = e.isRoundFinish ? 'finish'
+      : (e.state === 0 ? (e.tributeCardList.some(function (x) { return !x; }) ? 'tribute' : 'return') : 'play');
+
+    const rep = replayActions(e.playedCardList, e.firstPlayer || 1, e.playedTypeList);
+    e.rankList = rep.rankList;
+    e.trickOwner = rep.trickOwner;
+    e.lastCards = rep.lastCards;
+    e.lastInterp = rep.lastInterp;
+    e.lastSegmentPlayer = rep.lastSegmentPlayer;
+    e.currentPlayer = rep.currentPlayer;
+    e.trickActions = rep.trickActions;
+    e.initialHolders = rep.initialHolders;
+    e.actions = rep.actions;
+    e.canPlayAnyCards = !rep.trickOwner;
+
+    const lists = [[], [], [], [], []];
+    const cpl = e.cardPositionList;
+    for (let i = 0; i < TOTAL; i++) {
+      const v = Number(cpl[i]) || 0;
+      const owner = v & 7;
+      if (owner >= 1 && owner <= 4) lists[owner].push(i + 1);
+    }
+    e.playerCardLists = lists;
+    e.playerRestCardCounts = [0, lists[1].length, lists[2].length, lists[3].length, lists[4].length];
+
+    e.resistInfo = (roles.tributers.length && e.state > 0 && !e.tributeCardList.length)
+      ? roles.tributers.map(function (pos) {
+        let cnt = 0;
+        for (let n = 0; n < TOTAL; n++) {
+          const owner = rep.initialHolders[n] || (Number(cpl[n]) & 7);
+          if (owner === pos && normalizeId(n + 1) === 53) cnt += 1;
+        }
+        return { position: pos, bigJokerCount: cnt };
+      }) : [];
+
+    e.roundResult = e.isRoundFinish
+      ? roundResultOf(rep.rankList, e.team13Level, e.team24Level, e.level, e.playingTeam)
+      : null;
+
+    return e;
+  }
+
+  /* ============================ 辅助查询 ============================ */
+
+  function myHand(expanded, seat) {
+    if (!expanded || !expanded.playerCardLists) return [];
+    return (expanded.playerCardLists[seat] || []).slice();
+  }
+
+  function relativeSeatName(seat, mySeat) {
+    const s = Number(seat);
+    const me = Number(mySeat);
+    if (s === me) return '我';
+    if (s === partnerOf(me)) return '对家';
+    if (s === (me % 4 + 1)) return '下家';
+    return '上家';
+  }
+
+  /** 记牌器：其他玩家手中未知的牌 */
+  function remainingCounts(expanded, seat) {
+    const level = normLevel(expanded && expanded.level);
+    const played = {};
+    const mine = {};
+    let playedWild = 0;
+    let mineWild = 0;
+    const pl = (expanded && expanded.playedCardList) || [];
+    const playedIds = new Set();
+    let dupPlayed = false;
+    pl.forEach(function (v) {
+      if (!v) return;
+      const id = Number(v);
+      if (playedIds.has(id)) dupPlayed = true;
+      playedIds.add(id);
+      const r = rankOf(v);
+      played[r] = (played[r] || 0) + 1;
+      if (isWildCard(v, level)) playedWild += 1;
+    });
+    const hand = myHand(expanded, seat);
+    const mineIds = new Set(hand.map(Number));
+    let overlap = 0;
+    mineIds.forEach(function (id) { if (playedIds.has(id)) overlap += 1; });
+    hand.forEach(function (v) {
+      const r = rankOf(v);
+      mine[r] = (mine[r] || 0) + 1;
+      if (isWildCard(v, level)) mineWild += 1;
+    });
+    let wildTotal = 0;
+    for (let i = 1; i <= TOTAL; i++) if (isWildCard(i, level)) wildTotal += 1;
+    const order = [17, 16, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2];
+    const warnings = [];
+    if (dupPlayed) warnings.push('已出牌列表出现重复牌');
+    if (overlap > 0) warnings.push('同一张牌既在已出记录又在我的手牌（' + overlap + ' 张）');
+    let overflow = 0;
+    const byRank = order.map(function (rank) {
+      const total = rank >= 16 ? 2 : 8;
+      const p = played[rank] || 0;
+      const m = mine[rank] || 0;
+      if (p + m > total) overflow += p + m - total;
+      return {
+        rank: rank,
+        text: rankText(rank),
+        total: total,
+        played: p,
+        mine: m,
+        remaining: Math.max(0, total - p - m),
+        isLevel: rank === level,
+        isWild: rank === level
+      };
+    });
+    if (overflow > 0) warnings.push('已出+我手超过该点数总张数（' + overflow + ' 张）');
+    const playedCount = pl.filter(function (v) { return v > 0; }).length;
+    const unknown = TOTAL - playedCount - hand.length;
+    if (unknown < 0) warnings.push('已出+我手超过全副牌总数');
+    return {
+      byRank: byRank,
+      wildRemaining: Math.max(0, wildTotal - playedWild - mineWild),
+      total: TOTAL,
+      playedCount: playedCount,
+      mineCount: hand.length,
+      unknown: unknown,
+      ok: warnings.length === 0,
+      warnings: warnings
+    };
+  }
+
+  /** 进贡候选：排除逢人配后取最大同点牌 */
+  function tributeCandidates(expanded, seat) {
+    const level = normLevel(expanded && expanded.level);
+    const hand = myHand(expanded, seat);
+    const list = hand.filter(function (c) { return !isWildCard(c, level); });
+    const pool = list.length ? list : hand.slice();
+    if (!pool.length) return [];
+    let max = -1;
+    pool.forEach(function (c) {
+      const o = levelOrder(rankOf(c), level);
+      if (o > max) max = o;
+    });
+    return pool.filter(function (c) { return levelOrder(rankOf(c), level) === max; })
+      .sort(function (a, b) { return a - b; });
+  }
+
+  /** 还贡候选：优先自然点数<=10 且非级牌；否则除级牌外最小点数 */
+  function returnCandidates(expanded, seat) {
+    const level = normLevel(expanded && expanded.level);
+    const hand = myHand(expanded, seat);
+    const first = hand.filter(function (c) {
+      return rankOf(c) <= 10 && rankOf(c) !== level && !isWildCard(c, level);
+    });
+    if (first.length) return first.slice().sort(function (a, b) { return a - b; });
+    const rest = hand.filter(function (c) { return rankOf(c) !== level && !isWildCard(c, level); });
+    const pool = rest.length ? rest : hand.slice();
+    if (!pool.length) return [];
+    let min = Infinity;
+    pool.forEach(function (c) {
+      const o = levelOrder(rankOf(c), level);
+      if (o < min) min = o;
+    });
+    return pool.filter(function (c) { return levelOrder(rankOf(c), level) === min; })
+      .sort(function (a, b) { return a - b; });
+  }
+
+  /* ============================ 走法生成 ============================ */
+
+  const MOVE_LIMIT = 400;
+
+  /**
+   * 生成走法（prevCode=0 领出，否则只保留能压 prevCode 的）。
+   * @returns {object[]} Play[]
+   */
+  function genMoves(hand, level, prevCode) {
+    const lv = normLevel(level);
+    const prev = Number(prevCode) || 0;
+    const h = uniqNumbers(hand).filter(function (c) { return c >= 1 && c <= TOTAL; }).sort(function (a, b) { return a - b; });
+    if (!h.length) return [];
+
+    const wilds = h.filter(function (c) { return isWildCard(c, lv); });
+    const others = h.filter(function (c) { return !isWildCard(c, lv); });
+    const groups = {};
+    others.forEach(function (c) {
+      const r = levelOrder(rankOf(c), lv);
+      (groups[r] || (groups[r] = [])).push(c);
+    });
+    const rankKeys = Object.keys(groups).map(Number);
+
+    const out = [];
+    const seen = {};
+
+    function add(cards) {
+      if (!cards || !cards.length) return;
+      const cs = cards.slice().sort(function (a, b) { return a - b; });
+      const key = cs.join(',');
+      if (seen[key]) return;
+      seen[key] = 1;
+      const code = bestCode(cs, prev, lv);
+      if (!code) return;
+      const play = playFromCards(cs, lv, code);
+      if (play) out.push(play);
+    }
+    function pick(arr, n) {
+      return arr.slice(0, Math.max(0, n));
+    }
+
+    // 单张
+    h.forEach(function (c) { add([c]); });
+
+    // 对子 / 三同张 / 炸弹（同点组 + 逢人配补位）
+    rankKeys.forEach(function (r) {
+      const g = groups[r];
+      const n = g.length;
+      const maxW = Math.min(wilds.length, 2);
+      for (let w = 0; w <= maxW; w++) {
+        const take = 2 - w;
+        if (take >= 1 && take <= n && !(w > 0 && r >= 16)) add(pick(g, take).concat(pick(wilds, w)));
+      }
+      for (let w = 0; w <= maxW; w++) {
+        const take = 3 - w;
+        if (take >= 1 && take <= n && !(w > 0 && r >= 16)) add(pick(g, take).concat(pick(wilds, w)));
+      }
+      for (let size = 4; size <= 8; size++) {
+        for (let w = 0; w <= Math.min(wilds.length, size - 1); w++) {
+          const take = size - w;
+          if (take >= 1 && take <= n && !(w > 0 && r >= 16)) add(pick(g, take).concat(pick(wilds, w)));
+        }
+      }
+    });
+    // 两张逢人配组成的级牌对子
+    if (wilds.length >= 2) add(pick(wilds, 2));
+
+    // 三带二
+    rankKeys.forEach(function (e) {
+      const ge = groups[e];
+      rankKeys.forEach(function (i) {
+        if (i === e) return;
+        const gi = groups[i];
+        const maxWe = Math.min(wilds.length, 2);
+        for (let we = 0; we <= maxWe; we++) {
+          if (we > 0 && e >= 16) continue;
+          const takeE = 3 - we;
+          if (takeE < 1 || takeE > ge.length) continue;
+          const leftW = wilds.length - we;
+          for (let wi = 0; wi <= Math.min(leftW, 2); wi++) {
+            if (wi > 0 && i >= 16) continue;
+            const takeI = 2 - wi;
+            if (takeI < 1 || takeI > gi.length) continue;
+            add(pick(ge, takeE).concat(pick(gi, takeI)).concat(pick(wilds, we + wi)));
+          }
+        }
+      });
+    });
+
+    function rankCards(target, suit) {
+      return others.filter(function (c) {
+        return rankOf(c) === target && (suit === undefined || suitOf(c) === suit);
+      });
+    }
+
+    // 顺子 / 同花顺
+    for (let b = 5; b <= 14; b++) {
+      const win = [];
+      for (let P = b - 4; P <= b; P++) win.push((P === 1 && b === 5) ? 14 : P);
+      const builds = [];
+      for (let s = -1; s < 4; s++) {
+        const picked = [];
+        let miss = 0;
+        win.forEach(function (target) {
+          const cand = rankCards(target, s === -1 ? undefined : s);
+          if (cand.length) picked.push(cand[0]);
+          else miss += 1;
+        });
+        builds.push({ picked: picked, miss: miss });
+      }
+      builds.forEach(function (bd) {
+        if (bd.miss <= wilds.length) add(bd.picked.concat(pick(wilds, bd.miss)));
+      });
+    }
+
+    // 钢板（二连三）
+    for (let e = 2; e <= 14; e++) {
+      const win = [e - 1, e];
+      let picked = [];
+      let miss = 0;
+      win.forEach(function (P) {
+        const target = (P === 1 && e === 2) ? 14 : P;
+        const cand = rankCards(target);
+        const take = Math.min(3, cand.length);
+        picked = picked.concat(cand.slice(0, take));
+        miss += 3 - take;
+      });
+      if (miss <= wilds.length) add(picked.concat(pick(wilds, miss)));
+    }
+
+    // 三连对
+    for (let e = 3; e <= 14; e++) {
+      const win = [e - 2, e - 1, e];
+      let picked = [];
+      let miss = 0;
+      win.forEach(function (P) {
+        const target = (P === 1 && e === 3) ? 14 : P;
+        const cand = rankCards(target);
+        const take = Math.min(2, cand.length);
+        picked = picked.concat(cand.slice(0, take));
+        miss += 2 - take;
+      });
+      if (miss <= wilds.length) add(picked.concat(pick(wilds, miss)));
+    }
+
+    // 四大天王
+    const bigs = others.filter(function (c) { return rankOf(c) === 17; });
+    const smalls = others.filter(function (c) { return rankOf(c) === 16; });
+    if (bigs.length >= 2 && smalls.length >= 2) add(bigs.slice(0, 2).concat(smalls.slice(0, 2)));
+
+    if (out.length > MOVE_LIMIT) out.length = MOVE_LIMIT;
+    return out;
+  }
+
+  /* ============================ AI state ============================ */
+
+  function buildAIState(expanded, seat) {
+    const mySeat = Number(seat) || 1;
+    const level = normLevel(expanded && expanded.level);
+    const hand = myHand(expanded, mySeat);
+    const partner = partnerOf(mySeat);
+    const tributers = (expanded && expanded.tributers) || [];
+    const receivers = (expanded && expanded.tributeReceivers) || [];
+    const tributeSlots = (expanded && expanded.tributeCardList) || [];
+    const myTributeIdx = tributers.indexOf(mySeat);
+    const mustTribute = expanded && expanded.phase === 'tribute' && myTributeIdx >= 0 && !tributeSlots[myTributeIdx];
+    const mustReturn = expanded && expanded.phase === 'return' && receivers.indexOf(mySeat) >= 0;
+
+    const seats = [];
+    for (let s = 1; s <= 4; s++) {
+      seats.push({
+        seat: s,
+        name: relativeSeatName(s, mySeat),
+        count: (expanded && expanded.playerCardLists && expanded.playerCardLists[s]) ? expanded.playerCardLists[s].length : 0,
+        isMe: s === mySeat,
+        isPartner: s === partner,
+        isTributer: tributers.indexOf(s) >= 0,
+        rankBadge: (expanded && expanded.rankList && expanded.rankList.indexOf(s) >= 0) ? expanded.rankList.indexOf(s) + 1 : null
+      });
+    }
+
+    const history = ((expanded && expanded.actions) || []).slice(-6).map(function (a) {
+      return {
+        seat: a.seat,
+        seatName: relativeSeatName(a.seat, mySeat),
+        cards: a.cards && a.cards.length ? cardTexts(a.cards) : [],
+        passed: !!a.passed,
+        name: a.code ? typeName(a.code) : ''
+      };
+    });
+
+    const lastPlay = (expanded && expanded.trickOwner)
+      ? {
+        seat: expanded.trickOwner,
+        seatName: relativeSeatName(expanded.trickOwner, mySeat),
+        isPartner: expanded.trickOwner === partner,
+        name: expanded.lastInterp ? typeName(expanded.lastInterp) : '',
+        code: expanded.lastInterp || 0,
+        cards: (expanded.lastCards || []).slice(),
+        cardsText: cardTexts(expanded.lastCards || []).join('')
+      }
+      : null;
+
+    return {
+      level: level,
+      levelText: rankText(level),
+      heartLevelCardId: heartLevelId(level),
+      wildText: '♥' + rankText(level),
+      mySeat: mySeat,
+      mySeatName: '我',
+      partnerSeat: partner,
+      partnerSeatName: '对家',
+      hand: hand,
+      handText: cardTexts(hand),
+      prevCode: (expanded && expanded.trickOwner) ? (expanded.lastInterp || 0) : 0,
+      lastPlay: lastPlay,
+      trickOwner: expanded ? expanded.trickOwner : 0,
+      canPlayAny: !(expanded && expanded.trickOwner),
+      isMyTurn: expanded
+        ? (expanded.phase === 'play' ? expanded.currentPlayer === mySeat : (mustTribute || mustReturn))
+        : false,
+      phase: expanded ? expanded.phase : '',
+      seatsRemaining: seats,
+      history: history,
+      counter: remainingCounts(expanded, mySeat),
+      remaining: remainingCounts(expanded, mySeat).byRank,
+      wildRemaining: remainingCounts(expanded, mySeat).wildRemaining,
+      tributers: tributers,
+      tributeReceivers: receivers,
+      mustTribute: !!mustTribute,
+      mustReturn: !!mustReturn,
+      roundResult: expanded ? expanded.roundResult : null,
+      rankList: expanded ? expanded.rankList : []
+    };
+  }
+
+  /* ============================ 发牌（测试/演示用） ============================ */
+
+  function createRng(seed) {
+    let a = (Number(seed) || 1) >>> 0;
+    return function () {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function deal(seed) {
+    const rng = createRng(seed);
+    const deck = [];
+    for (let i = 1; i <= TOTAL; i++) deck.push(i);
+    for (let i = deck.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const tmp = deck[i];
+      deck[i] = deck[j];
+      deck[j] = tmp;
+    }
+    const hands = [[], [], [], []];
+    for (let i = 0; i < deck.length; i++) hands[i % 4].push(deck[i]);
+    hands.forEach(function (h) { h.sort(function (a, b) { return a - b; }); });
+    return { hands: hands, seed: seed };
+  }
+
+  /* ============================ 导出 ============================ */
+
+  return {
+    VERSION: VERSION,
+    CARD: { TOTAL: TOTAL, DECKS: DECKS },
+    TYPE: TYPE,
+    TYPE_NAME: TYPE_NAME,
+    SUITS: SUIT_SYMBOLS,
+
+    normLevel: normLevel,
+    normalizeId: normalizeId,
+    cardDeck: cardDeck,
+    cardLocal: cardLocal,
+    rankOf: rankOf,
+    suitOf: suitOf,
+    isJoker: isJoker,
+    levelOrder: levelOrder,
+    isLevelCard: isLevelCard,
+    isWildCard: isWildCard,
+    heartLevelId: heartLevelId,
+    rankText: rankText,
+    cardText: cardText,
+    cardTexts: cardTexts,
+    typeName: typeName,
+    bombValue: bombValue,
+    partnerOf: partnerOf,
+    sameTeam: sameTeam,
+    relativeSeatName: relativeSeatName,
+
+    interpretCodes: interpretCodes,
+    bestCode: bestCode,
+    beats: beats,
+    playFromCards: playFromCards,
+    sortHand: sortHand,
+
+    decodeGameData: decodeGameData,
+    encodeGameData: encodeGameData,
+    replayActions: replayActions,
+    expandState: expandState,
+    tributeRoles: tributeRoles,
+    roundResultOf: roundResultOf,
+
+    myHand: myHand,
+    remainingCounts: remainingCounts,
+    tributeCandidates: tributeCandidates,
+    returnCandidates: returnCandidates,
+    genMoves: genMoves,
+    buildAIState: buildAIState,
+
+    createRng: createRng,
+    deal: deal
+  };
+});
+
 /* ===== dg.core.js ===== */
 /*!
  * dg.core.js — 控牌助手 · 数据层（斗地主 rule=0/1 + 掼蛋 rule=2）
@@ -1835,13 +3010,15 @@
  * CAS 与字节数上限校验，不校验牌面归属 → 任何玩家都能改写「谁有什么牌」。
  */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.DG = api;
-})(typeof self !== 'undefined' ? self : globalThis, function () {
+})(typeof self !== 'undefined' ? self : globalThis, function (root) {
   'use strict';
 
   const VERSION = '1.0.0';
+  const GD = typeof module !== 'undefined' && module.exports ? require('./vendor/gd.site.core.js') : root.GDSite;
+  const DDZ = typeof module !== 'undefined' && module.exports ? require('./vendor/ddz.core.js') : root.DDZEngine;
 
   /** cardPositionList 的低 3 位 = 归属座位（1..N，7 = 无主） */
   const SEAT_MASK = 7;
@@ -2078,298 +3255,195 @@
 
   /* ════════════════════════════════ 换牌 ════════════════════════════════ */
 
-  /**
-   * 给某个 donor 挑一张「送出去最不亏」的牌。
-   * 规则：先在我最差的 3 张里挑，再优先挑 donor 手里同点数张数多的那张
-   *      （他拿到后能凑对/凑炸，主观上不会觉得牌被别人动过）。
-   */
-  function pickGive(giveable, donor, view, rng) {
-    if (!giveable.length) return 0;
-    const sorted = giveable.slice().sort(function (a, b) {
-      const wa = cardWeight(a) + (isJoker(a) ? 100 : 0);
-      const wb = cardWeight(b) + (isJoker(b) ? 100 : 0);
-      if (wa !== wb) return wa - wb;
-      return a - b;
+  /** 已出牌必须同时出现在流水中、且当前不属于任何座位；无主暗池不是已出牌。 */
+  function playedPool(raw, opts) {
+    const v = expand(raw, opts);
+    return uniqNums(v.played).filter(function (id) {
+      return id <= v.total && (Number(raw.cardPositionList[id - 1]) & SEAT_MASK) === 0;
     });
-    const pool = sorted.slice(0, Math.min(3, sorted.length));
-    const donorRanks = rankCounts(view.hands[donor] || []);
-    let best = pool[0];
-    let bestScore = -1;
-    pool.forEach(function (c) {
-      const same = donorRanks[rankOf(c)] || 0;      // donor 已有几张这个点数
-      const score = same * 10 + (4 - pool.indexOf(c));
-      if (score > bestScore) { bestScore = score; best = c; }
-    });
-    return best;
-  }
-
-  /**
-   * 计算换牌方案（纯计算，不发消息、不改入参）。
-   *
-   * @param {object} raw      当前 DDZGameData
-   * @param {number[]} want   想拿到手上的牌（1..total 的 id）
-   * @param {object} opts
-   *   @param {number} opts.mySeat     我的座位（room.position，1 基）
-   *   @param {number} [opts.seats]    座位数
-   *   @param {boolean} [opts.allowHole] 是否允许动底牌（会显示归属，默认关）
-   *   @param {boolean} [opts.preferPool] 优先用无主暗池（默认开）
-   * @returns {object} plan
-   */
-  function plan(raw, want, opts) {
-    const o = opts || {};
-    const mySeat = Math.floor(Number(o.mySeat) || 0);
-    const view = expand(raw, { seats: o.seats });
-    const notes = [];
-    const problems = [];
-
-    if (!mySeat || mySeat < 1 || mySeat > view.seats) {
-      return fail(view, '读不到我的座位（room.position），请先入座');
-    }
-
-    const mine = view.hands[mySeat].slice();
-    const mineSet = new Set(mine);
-    const wantList = uniqNums(want).filter(function (id) { return id <= view.total; });
-    if (!wantList.length) {
-      return Object.assign(fail(view, ''), { ok: true, noop: true, changes: [], gained: [], given: [], donors: [] });
-    }
-
-    const wantSet = new Set(wantList);
-    const holeSet = new Set(view.holes);
-    const changes = [];
-    const gained = [];
-    const given = [];
-    const donors = new Map();
-    const blocked = [];
-    const giveable = mine.filter(function (c) { return !wantSet.has(c); });
-    let freeGain = 0;
-    let swapGain = 0;
-    let twinGain = 0;
-
-    // donor 挑选顺序：手牌多的先（他更难数清），再按座位号
-    const donorOrder = [];
-    for (let s = 1; s <= view.seats; s++) if (s !== mySeat) donorOrder.push(s);
-    donorOrder.sort(function (a, b) { return (view.counts[b] - view.counts[a]) || (a - b); });
-
-    wantList.forEach(function (card) {
-      if (mineSet.has(card)) { gained.push(card); return; }
-      const owner = view.owners[card] || 0;
-
-      // ① 无主牌：直接拿，零代价（斗地主 2 人局的暗池 / 未认领底牌）
-      if (owner === 0) {
-        if (holeSet.has(card) && !o.allowHole) { blocked.push(card); return; }
-        changes.push({ card: card, from: 0, to: mySeat, role: 'gain' });
-        gained.push(card);
-        freeGain++;
-        return;
-      }
-
-      // ② 等价交换：拿走 donor 的牌，还他一张我的闲牌
-      if (!giveable.length) { blocked.push(card); return; }
-      const give = pickGive(giveable, owner, view);
-      if (!give) { blocked.push(card); return; }
-      giveable.splice(giveable.indexOf(give), 1);
-      changes.push({ card: card, from: owner, to: mySeat, role: 'gain' });
-      changes.push({ card: give, from: mySeat, to: owner, role: 'give' });
-      gained.push(card);
-      given.push(give);
-      const d = donors.get(owner) || { seat: owner, got: [], gave: [] };
-      d.got.push(card);
-      d.gave.push(give);
-      donors.set(owner, d);
-      // 掼蛋两副牌：donor 手上还有同一张牌的另一份 → 他「我有 A」的记忆依然成立
-      const twin = twinOf(card, view.kind);
-      if (twin && twin <= view.total && (view.owners[twin] || 0) === owner) twinGain++;
-      else swapGain++;
-    });
-
-    if (blocked.length && !gained.length) {
-      return fail(view, '目标牌拿不到：' + cardTexts(blocked).join(' ') +
-        (blocked.some(function (c) { return holeSet.has(c); }) ? '（底牌会显示归属，默认不动）' : '（我没有可交换出去的闲牌）'));
-    }
-    if (blocked.length) {
-      notes.push('这些牌跳过：' + cardTexts(blocked).join(' ') + '（底牌归属 / 无闲牌可换）');
-    }
-
-    const planObj = {
-      ok: changes.length > 0 || blocked.length === 0,
-      noop: changes.length === 0,
-      view: view,
-      mySeat: mySeat,
-      want: wantList,
-      gained: gained,
-      given: given,
-      keep: wantList.filter(function (c) { return mineSet.has(c); }),
-      donors: Array.from(donors.values()),
-      changes: changes,
-      risk: riskOf({ freeGain: freeGain, swapGain: swapGain, twinGain: twinGain, donors: Array.from(donors.values()), kind: view.kind }),
-      notes: notes,
-      error: '',
-      stats: { freeGain: freeGain, swapGain: swapGain, twinGain: twinGain, keep: wantList.filter(function (c) { return mineSet.has(c); }).length },
-      summary: ''
-    };
-    planObj.summary = summaryOf(planObj);
-    return planObj;
   }
 
   function fail(view, error) {
+    return { ok: false, noop: false, view: view, error: error, gained: [], given: [], keep: [], changes: [], notes: [], stats: {} };
+  }
+
+  function validIds(cards, total) {
+    return Array.isArray(cards) && cards.every(function (id) { return Number.isInteger(id) && id > 0 && id <= total; }) && new Set(cards).size === cards.length;
+  }
+
+  /** 用换出的牌替代历史中的换入牌，保留动作分隔和牌型；改变牌型则整体中止。 */
+  function exchangeHistory(raw, incoming, outgoing, view) {
+    const map = new Map(incoming.map(function (id, i) { return [id, outgoing[i]]; }));
+    const history = (raw.playedCardList || []).map(function (id) { return map.has(id) ? map.get(id) : id; });
+    const types = (raw.playedTypeList || []).slice();
+    const old = raw.playedCardList || [];
+    if (old.length && old[0] !== 0) throw new Error('出牌流水缺少动作分隔');
+    let segment = -1;
+    let start = 0;
+    for (let i = 0; i <= old.length; i++) {
+      if (i < old.length && old[i] !== 0) continue;
+      if (segment >= 0) {
+        const prev = old.slice(start, i);
+        const next = history.slice(start, i);
+        if (prev.some(function (id) { return map.has(id); })) {
+          if (view.kind === 'gd') {
+            const code = Number(types[segment]) || GD.bestCode(prev, 0, view.level);
+            const candidates = GD.interpretCodes(next, view.level).filter(function (c) { return (c >> 8) === (code >> 8); });
+            if (!candidates.length) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
+            types[segment] = candidates.indexOf(code) >= 0 ? code : candidates[candidates.length - 1];
+          } else {
+            const a = DDZ.parseCards(view.seats < 4, prev);
+            const b = DDZ.parseCards(view.seats < 4, next);
+            if (!a[0] || a[0] !== b[0]) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
+          }
+        }
+        if (next.length) {
+          // 复用站点回放确定当前墩；逐手检查，防止改小前手或改大后被压牌。
+          const prefix = history.slice(0, start - 1);
+          let legal;
+          if (view.kind === 'gd') {
+            const rep = GD.replayActions(prefix, raw.firstPlayer || 1, types);
+            const prevCode = rep.lastInterp || GD.bestCode(rep.lastCards, 0, view.level);
+            const code = Number(types[segment]) || GD.bestCode(next, 0, view.level);
+            legal = GD.interpretCodes(next, view.level).indexOf(code) >= 0 && GD.beats(code, prevCode);
+          } else {
+            const rep = DDZ.expandState(Object.assign({}, raw, { playedCardList: prefix }), view.seats);
+            legal = DDZ.canBeat(view.seats < 4, next, rep.lastCards);
+          }
+          if (!legal) throw new Error('第 ' + (segment + 1) + ' 手不符合牌型或连续压牌关系，请调整换出牌');
+        }
+      }
+      if (i < old.length) { segment++; start = i + 1; }
+    }
+    return { cards: history, types: types };
+  }
+
+  /** 只从已出牌换入；换出的每张牌都由调用方显式选择。失败不生成部分方案。 */
+  function plan(raw, want, opts) {
+    const o = opts || {};
+    const v = expand(raw, o);
+    const seat = Number(o.mySeat);
+    if (!Number.isInteger(seat) || seat < 1 || seat > v.seats) return fail(v, '请先入座');
+    if (v.phase !== 'play') return fail(v, '只在出牌阶段交换');
+    const give = o.give || [];
+    if (!validIds(want, v.total) || !validIds(give, v.total)) return fail(v, '牌 ID 越界、重复或格式错误');
+    if (!want.length && !give.length) return Object.assign(fail(v, ''), { ok: true, noop: true });
+    const pool = new Set(playedPool(raw, o));
+    if (want.some(function (id) { return !pool.has(id); })) return fail(v, '换入只能选已打出的牌，其他人的手牌、底牌和暗池均不参与');
+    if (give.some(function (id) { return v.hands[seat].indexOf(id) < 0; })) return fail(v, '换出只能选我当前的手牌');
+    if (want.length !== give.length) return fail(v, '请选择等量换出牌：换入 ' + want.length + ' 张 / 换出 ' + give.length + ' 张');
+    if (!want.length) return fail(v, '请先选择已出牌');
+    if (want.some(function (id) { return v.played.filter(function (c) { return c === id; }).length !== 1; })) return fail(v, '出牌记录存在重复牌，已中止交换');
+    let history;
+    try { history = exchangeHistory(raw, want, give, v); } catch (e) { return fail(v, e.message); }
+    const changes = [];
+    want.forEach(function (id, i) {
+      changes.push({ card: id, from: 0, to: seat, role: 'gain' });
+      changes.push({ card: give[i], from: seat, to: 0, role: 'give' });
+    });
     return {
-      ok: false, noop: false, error: error || '', view: view,
-      mySeat: 0, want: [], gained: [], given: [], keep: [], donors: [], changes: [],
-      risk: { level: 'unknown', score: 0, text: '—', reasons: [] }, notes: [], stats: {}, summary: ''
+      ok: true, noop: false, view: v, mySeat: seat, gained: want.slice(), given: give.slice(), keep: [], changes: changes,
+      history: history.cards, types: history.types, originalTypes: (raw.playedTypeList || []).slice(),
+      notes: ['仅交换已出牌与我的手牌；对应历史牌面会替换为换出牌，其他人的在手牌保持不变。'],
+      stats: { swapGain: want.length }, summary: '换入 ' + cardTexts(want).join(' ') + '；换出 ' + cardTexts(give).join(' ')
     };
   }
 
-  /**
-   * 隐蔽性评分：
-   *   none   —— 只动了无主暗池 / 掼蛋的重复副本，没有任何人能「数出来」
-   *   low    —— 等价交换，且补给他的牌能凑上他已有的点数
-   *   medium —— 等价交换，但他手上原来没有这个点数（可能想起「我摸过这张」）
-   */
-  function riskOf(st) {
-    const reasons = [];
-    let score = 0;
-    if (st.freeGain) { reasons.push('无主暗池 ' + st.freeGain + ' 张（全桌都看不到这些牌）'); }
-    if (st.twinGain) { score += 1; reasons.push('取的是他手上的重复副本 ' + st.twinGain + ' 张（掼蛋两副牌，他「有这张」的记忆不变）'); }
-    if (st.swapGain) { score += 3; reasons.push('等价交换 ' + st.swapGain + ' 张（张数守恒，但被他逐帧比对时能看出）'); }
-    st.donors.forEach(function (d) {
-      const ranks = rankCounts(d.gave);
-      Object.keys(ranks).forEach(function (r) { reasons.push('座位 ' + d.seat + ' 收到 ' + d.gave.map(cardText).join(' ') + '（凑 ' + rankText(Number(r)) + '）'); });
-    });
-    let level = 'none';
-    if (score >= 3) level = 'medium';
-    else if (score >= 1) level = 'low';
-    if (st.freeGain && !score) level = 'none';
-    const text = level === 'none' ? '无痕' : (level === 'low' ? '低' : '中');
-    return { level: level, score: score, text: text, reasons: reasons };
-  }
-
-  function summaryOf(p) {
-    const bits = [];
-    if (p.gained.length) bits.push('得到 ' + cardTexts(p.gained).join(' '));
-    if (p.given.length) bits.push('送出 ' + cardTexts(p.given).join(' '));
-    if (!p.changes.length) return '无需改动';
-    return bits.join('；');
-  }
-
-  /** 把 plan 应用到 raw，返回新的 raw（深拷贝相关字段，其余原样带上） */
-  function applyPlan(raw, planObj) {
+  function applyPlan(raw, p) {
+    if (!p || !p.ok) throw new Error('仅可应用通过校验的换牌方案');
     const out = {};
-    Object.keys(raw || {}).forEach(function (k) {
-      const v = raw[k];
-      out[k] = Array.isArray(v) ? v.slice() : v;
+    Object.keys(raw).forEach(function (k) { out[k] = Array.isArray(raw[k]) ? raw[k].slice() : raw[k]; });
+    (p.changes || []).forEach(function (ch) {
+      out.cardPositionList[ch.card - 1] = (Number(out.cardPositionList[ch.card - 1]) & ~SEAT_MASK) | ch.to;
     });
-    const cpl = Array.isArray(raw.cardPositionList) ? raw.cardPositionList.map(Number) : [];
-    (planObj.changes || []).forEach(function (ch) {
-      const idx = ch.card - 1;
-      if (idx < 0) return;
-      const hole = (Number(cpl[idx]) || 0) & HOLE_BIT;   // 底牌标记跟着牌走
-      cpl[idx] = (ch.to & SEAT_MASK) | hole;
-    });
-    out.cardPositionList = cpl;
+    if (p.history) out.playedCardList = p.history.slice();
+    if (p.types) out.playedTypeList = p.types.slice();
     return out;
   }
 
-  /** 反向应用（出牌失败时回滚） */
-  function revertPlan(raw, planObj) {
-    return applyPlan(raw, { changes: (planObj.changes || []).map(function (ch) {
-      return { card: ch.card, to: ch.from };
-    }) });
+  function revertPlan(raw, p) {
+    const v = expand(raw, { seats: p.view.seats });
+    const hist = exchangeHistory(raw, p.given, p.gained, v);
+    return applyPlan(raw, { ok: true, changes: p.changes.map(function (ch) { return { card: ch.card, to: ch.from }; }), history: hist.cards, types: p.originalTypes || hist.types });
   }
 
-  /* ════════════════════════════════ 自洽性审计 ════════════════════════════════ */
-
-  const FROZEN_FIELDS = ['rule', 'state', 'landlordId', 'playedCardList', 'v', 'team13Level',
-    'team24Level', 'lastRankList', 'tributeCardList', 'returnCardList', 'firstPlayer', 'playedTypeList'];
-
-  /**
-   * 审计一次改动是否「自洽」——即：任何只读状态、不做历史比对的对手都看不出异常。
-   * 这是换牌能不能用的硬门槛，UI 上每次预览都会跑一遍。
-   * @param {object} before 改前 raw
-   * @param {object} after  改后 raw
-   * @param {{seats?:number}} [opts]
-   * @returns {{ok:boolean, problems:string[], touched:number[], countsSame:boolean}}
-   */
+  /** 独立重建允许的变更；旧 allowPool / allowHole 参数不再放行任何旁路。 */
   function audit(before, after, opts) {
     const o = opts || {};
-    const problems = [];
     const a = expand(before, o);
     const b = expand(after, o);
-    const allowPool = !!(o.allowPool || o.pool);
-
-    if (a.cplLength !== b.cplLength) problems.push('cardPositionList 长度变了（' + a.cplLength + ' → ' + b.cplLength + '）');
-    if (b.cplLength !== b.total) problems.push('cardPositionList 长度 ' + b.cplLength + ' ≠ 全副牌 ' + b.total + ' 张');
-
-    // ── 张数账本：允许「从无主暗池取牌」时，增加量必须正好等于暗池减少量 ──
-    const holeSetA = new Set(a.holes);
-    const poolA = a.unowned.filter(function (c) { return !holeSetA.has(c); });
-    const holeSetB = new Set(b.holes);
-    const poolB = b.unowned.filter(function (c) { return !holeSetB.has(c); });
-    const poolTaken = poolA.length - poolB.length;   // >0 表示有人从暗池里拿走了牌
-
-    let gained = 0;
-    let lost = 0;
-    const diff = [];
-    for (let s = 1; s <= a.seats; s++) {
-      const d = b.counts[s] - a.counts[s];
-      if (d > 0) gained += d; else if (d < 0) lost -= d;
-      if (d !== 0) diff.push(s + '号 ' + a.counts[s] + '→' + b.counts[s]);
-    }
-    const countsSame = gained === 0 && lost === 0;
-
-    if (!countsSame) {
-      if (!allowPool) {
-        problems.push('手牌张数变了（' + diff.join('，') + '）');
-      } else if (poolTaken < 0) {
-        problems.push('无主暗池凭空多出 ' + (-poolTaken) + ' 张牌');
-      } else if (gained - lost !== poolTaken) {
-        problems.push('张数账不平（手牌 +' + gained + ' −' + lost + '，暗池 −' + poolTaken + '）');
-      }
-    }
-    // 没有主动放行暗池，却出现了暗池减少 → 是「从别人不知道的地方偷牌」
-    if (!allowPool && poolTaken !== 0) {
-      problems.push('无主区被动了 ' + Math.abs(poolTaken) + ' 张（未开启暗池）');
-    }
-
-    // 冻结字段：换牌不该碰它们
-    FROZEN_FIELDS.forEach(function (k) {
-      const x = JSON.stringify(before && before[k] !== undefined ? before[k] : null);
-      const y = JSON.stringify(after && after[k] !== undefined ? after[k] : null);
-      if (x !== y) problems.push('字段 ' + k + ' 被改动');
-    });
-
-    // 张数上限（发牌时每人不超 handSize；开启暗池时允许多出取走的暗池数）
-    const capBonus = allowPool ? Math.max(0, poolTaken) : 0;
-    for (let s = 1; s <= a.seats; s++) {
-      if (b.counts[s] > a.handSize + capBonus && b.counts[s] > a.counts[s]) {
-        problems.push(s + '号手牌 ' + b.counts[s] + ' 张，超过发牌张数 ' + (a.handSize + capBonus));
-      }
-    }
-
-    // 已出过的牌不能又回到任何人手上（否则同一张牌会在桌面与手牌同时出现）
-    const playedSet = new Set(b.played);
-    let dup = 0;
-    for (let s = 1; s <= b.seats; s++) {
-      b.hands[s].forEach(function (c) { if (playedSet.has(c)) dup++; });
-    }
-    if (dup) problems.push('有 ' + dup + ' 张已打出的牌又出现在手牌里');
-
-    // 底牌标记不能被无故改动
-    const holeA = a.holes.slice().sort(function (x, y) { return x - y; }).join(',');
-    const holeB = b.holes.slice().sort(function (x, y) { return x - y; }).join(',');
-    if (holeA !== holeB) problems.push('底牌标记被改动');
-
+    const problems = [];
     const touched = [];
-    const cplA = before && before.cardPositionList || [];
-    const cplB = after && after.cardPositionList || [];
-    const n = Math.min(cplA.length, cplB.length);
-    for (let i = 0; i < n; i++) {
-      if ((Number(cplA[i]) || 0) !== (Number(cplB[i]) || 0)) touched.push(i + 1);
+    const seats = new Set();
+    const incoming = [];
+    const outgoing = [];
+    for (let i = 0; i < a.total; i++) {
+      const x = Number(before.cardPositionList[i]);
+      const y = Number(after.cardPositionList[i]);
+      if (x === y) continue;
+      touched.push(i + 1);
+      const from = x & SEAT_MASK;
+      const to = y & SEAT_MASK;
+      if ((x & ~SEAT_MASK) !== (y & ~SEAT_MASK)) problems.push('底牌标记或高位被改动');
+      if (from === 0 && to >= 1 && to <= a.seats) { incoming.push(i + 1); seats.add(to); }
+      else if (to === 0 && from >= 1 && from <= a.seats) { outgoing.push(i + 1); seats.add(from); }
+      else problems.push('存在场上座位之间或暗池的换牌');
     }
-    if (!allowPool && touched.length && touched.length % 2 !== 0) {
-      problems.push('改动张数为奇数（' + touched.length + '），不可能同时满足两个座位张数守恒');
+    const countsSame = Array.from({ length: a.seats }, function (_, i) { return a.counts[i + 1] === b.counts[i + 1]; }).every(Boolean);
+    if (!countsSame) problems.push('手牌张数不守恒');
+    if (a.cplLength !== b.cplLength || b.cplLength !== a.total) problems.push('cardPositionList 长度不匹配');
+    const seat = Number(o.mySeat) || Array.from(seats)[0];
+    if (seats.size > 1 || (seats.size && !seats.has(seat))) problems.push('改动了其他人的在手牌');
+    if (incoming.length !== outgoing.length) problems.push('换入和换出张数不同');
+    const beforeHistory = before.playedCardList || [];
+    const afterHistory = after.playedCardList || [];
+    // 按流水位置恢复配对，避免排序不同导致审计与用户选择错位。
+    const pairedOut = incoming.map(function (id) { return afterHistory[beforeHistory.indexOf(id)]; });
+    if (pairedOut.some(function (id) { return outgoing.indexOf(id) < 0; }) || new Set(pairedOut).size !== pairedOut.length) problems.push('出牌记录未按换出牌替换');
+    let expected = before;
+    if (incoming.length && !problems.length) {
+      const p = plan(before, incoming, { mySeat: seat, seats: a.seats, give: pairedOut });
+      if (!p.ok) problems.push(p.error);
+      else expected = applyPlan(before, p);
     }
+    Object.keys(PROTO_FIELDS).forEach(function (k) {
+      if (JSON.stringify(after[k] == null ? null : after[k]) !== JSON.stringify(expected[k] == null ? null : expected[k])) problems.push('字段 ' + k + ' 不符合交换方案');
+    });
+    const seen = new Set();
+    b.played.forEach(function (id) {
+      if (id > b.total || seen.has(id) || b.owners[id]) problems.push('已打出牌重复、越界或仍在手牌中');
+      seen.add(id);
+    });
+    return { ok: !problems.length, problems: problems, touched: touched, countsSame: countsSame, poolTaken: 0 };
+  }
 
-    return { ok: problems.length === 0, problems: problems, touched: touched, countsSame: countsSame, poolTaken: poolTaken };
+  /** 优先完整炸弹，再同花顺；组之间不重复占用同一物理牌。 */
+  function handGroups(hand, kind, level, seats) {
+    const cards = sortHand(hand);
+    let combos = [];
+    if (kind === 'gd') {
+      combos = GD.genMoves(cards, level, 0).filter(function (p) { return p.bomb > 0; }).map(function (p) {
+        return { cards: p.cards, kind: p.type === GD.TYPE.StraightFlush ? 'flush' : 'bomb', label: p.name, weight: p.bomb };
+      });
+    } else {
+      const ranks = {};
+      cards.forEach(function (id) { (ranks[rankOf(id)] || (ranks[rankOf(id)] = [])).push(id); });
+      Object.keys(ranks).forEach(function (r) { if (ranks[r].length >= 4) combos.push({ cards: ranks[r], kind: 'bomb', label: ranks[r].length + '张炸弹', weight: ranks[r].length }); });
+      const jokers = cards.filter(isJoker);
+      if (DDZ.parseCards(Number(seats) < 4 || !seats, jokers)[0] === DDZ.Jokers) combos.push({ cards: jokers, kind: 'bomb', label: '王炸', weight: 99 });
+    }
+    combos.sort(function (a, b) { return b.weight - a.weight || b.cards.length - a.cards.length || b.cards[0] - a.cards[0]; });
+    const used = new Set();
+    const out = [];
+    combos.forEach(function (p) {
+      if (p.cards.some(function (id) { return used.has(id); })) return;
+      p.cards.forEach(function (id) { used.add(id); });
+      out.push(p);
+    });
+    const ranks = {};
+    cards.forEach(function (id) { if (!used.has(id)) (ranks[rankOf(id)] || (ranks[rankOf(id)] = [])).push(id); });
+    Object.keys(ranks).map(Number).sort(function (a, b) { return b - a; }).forEach(function (r) { out.push({ cards: ranks[r], kind: 'rank', label: '' }); });
+    return out;
   }
 
   /* ════════════════════════════════ 预设牌型 ════════════════════════════════ */
@@ -2649,6 +3723,8 @@
     seatName: seatName,
     sortHand: sortHand,
 
+    playedPool: playedPool,
+    handGroups: handGroups,
     plan: plan,
     applyPlan: applyPlan,
     revertPlan: revertPlan,
@@ -3993,7 +5069,7 @@
 :host, .hqx-dg { all: initial; }
 * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
 .panel {
-  width: 442px; max-height: min(78vh, 760px); display: flex; flex-direction: column;
+  width: 442px; max-width: 100%; max-height: min(78vh, 760px); display: flex; flex-direction: column;
   background: linear-gradient(168deg, rgba(20,23,31,.965), rgba(13,15,20,.975));
   border: 1px solid rgba(255,255,255,.09); border-radius: 14px;
   box-shadow: 0 18px 50px -12px rgba(0,0,0,.75), 0 0 0 1px rgba(0,0,0,.4) inset;
@@ -4108,8 +5184,31 @@
 
 /* 透视 */
 .eyes { display: flex; flex-direction: column; gap: 3px; }
-.eyes .hh { display: flex; gap: 5px; align-items: baseline; }
-.eyes .hh .nm { width: 44px; color: #96a0b3; font-size: 11px; flex: none; }
+.eyes .hh { display: flex; flex-direction: column; gap: 5px; padding: 6px 0; border-bottom: 1px solid #ffffff12; }
+.eyes .hh:last-child { border-bottom: 0; }
+.poker-hand { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; width: 100%; padding: 3px 1px; }
+.poker-combo { display: flex; align-items: flex-end; gap: 2px; padding: 3px; border: 2px solid transparent; border-radius: 6px; position: relative; }
+.poker-combo.bomb { border-color: #f3b64a; background: #f3b64a20; }
+.poker-combo.flush { border-color: #4ddbd1; background: #4ddbd120; }
+.combo-label { position: absolute; top: -14px; left: 1px; white-space: nowrap; color: #ffd47e; font-size: 9px; line-height: 12px; }
+.flush .combo-label { color: #7aeee7; }
+.poker-combo.bomb, .poker-combo.flush { margin-top: 15px; }
+.card-stack { width: 31px; position: relative; flex: none; }
+.poker-card { all: unset; box-sizing: border-box; display: block; position: absolute; left: 0; width: 31px; height: 52px; padding: 2px 3px; color: #17202a; background: linear-gradient(145deg,#fff,#edf1f5); border: 1px solid #a8adb4; border-radius: 4px; box-shadow: 0 1px 3px #0005; font-family: Georgia,serif; cursor: default; }
+.poker-card.red { color: #dc2626; }
+.poker-card .rank { display: block; font-size: 15px; font-weight: 700; line-height: 17px; }
+.poker-card .suit { display: block; text-align: center; font-size: 25px; line-height: 26px; }
+.poker-card.joker .rank { font-family: sans-serif; font-size: 10px; }
+.poker-card.joker .suit { font-size: 22px; }
+.poker-card.hole { border-color: #dd9221; }
+.poker-card.wild { background: linear-gradient(145deg,#f3e8ff,#e0c9fa); }
+.poker-card.pick { cursor: pointer; }
+.poker-card.pick:hover, .poker-card.pick:focus-visible { outline: 2px solid #7cc8ff; outline-offset: 1px; z-index: 20; }
+.poker-card.chosen { border: 2px solid #23884c; background: #d8ffe5; box-shadow: 0 0 0 1px #70ed9e; }
+.pick-count { color: #a2c8b0; font-size: 11px; }
+.swap-help { font-size: 11px; color: #9ca8bb; line-height: 1.5; }
+.eyes-legend { color: #9aa8ba; font-size: 10px; margin-bottom: 3px; }
+.eyes .hh .nm { width: auto; color: #96a0b3; font-size: 11px; flex: none; }
 .eyes .hh .nm.me { color: #6ee7a0; font-weight: 600; }
 .eyes .hh .cd { flex: 1; font-size: 11px; color: #c2cbda; word-break: break-all; }
 
@@ -4189,7 +5288,7 @@
     if (o.document) DOC = o.document;
     if (!DOC) throw new Error('没有可用的 document');
     const wrap = el('div', 'hqx-dg');
-    wrap.style.cssText = 'position:fixed;z-index:2147483000;top:84px;right:16px;';
+    wrap.style.cssText = 'position:fixed;z-index:2147483000;top:84px;right:16px;max-width:calc(100% - 24px);';
     const shadow = wrap.attachShadow ? wrap.attachShadow({ mode: 'open' }) : wrap;
     const styleEl = el('style');
     styleEl.textContent = STYLE;
@@ -4220,25 +5319,6 @@
     const kvEl = el('div', 'kv');
     secStatus.append(kvEl);
 
-    /* 开局预设：这一局开始前就定好手牌 */
-    const secDeal = el('div', 'sec deal');
-    const capDeal = el('div', 'cap');
-    const dealFlag = el('span', 'sub', '未启用');
-    capDeal.append(el('span', null, '开局预设'), el('span', 'sp'), dealFlag);
-    const dealRow = el('div', 'row');
-    const btnDealSave = el('button', 'mini', '存为预设');
-    const btnDealToggle = el('button', 'mini', '每局自动');
-    const dealDelay = el('input');
-    dealDelay.type = 'number';
-    dealDelay.value = '260';
-    dealDelay.min = '0';
-    dealDelay.max = '3000';
-    dealDelay.step = '20';
-    dealRow.append(btnDealSave, btnDealToggle, el('span', 'sub', '延迟'), dealDelay, el('span', 'sub', 'ms'));
-    const dealCards = el('div', 'cards');
-    const dealNone = el('div', 'none', '选好牌 → 点「存为预设」，下一局发牌那一刻你就是这套牌。');
-    secDeal.append(capDeal, dealRow, dealCards, dealNone);
-
     /* AI 建议 */
     const secAi = el('div', 'sec ai');
     const capAi = el('div', 'cap');
@@ -4262,28 +5342,26 @@
     const recDet = el('div', 'det');
     secRec.append(capRec, recSum, recDet);
 
-    /* 预设 */
-    const secPreset = el('div', 'sec');
-    const capPreset = el('div', 'cap');
-    capPreset.append(el('span', null, '快捷目标'), el('span', 'sp'), el('span', 'sub', '点一下直接选中'));
-    const presetBox = el('div', 'presets');
-    secPreset.append(capPreset, presetBox);
-
     /* 选牌网格 */
     const secGrid = el('div', 'sec');
     const capGrid = el('div', 'cap');
-    const capGridTxt = el('span', null, '选牌');
-    const capGridHint = el('span', 'sub', '左键 +1 副本 / 右键 −1');
+    const capGridTxt = el('span', null, '已出牌换入');
+    const capGridHint = el('span', 'sub', '只列出已打出的物理牌');
     capGrid.append(capGridTxt, el('span', 'sp'), capGridHint);
-    const gridBox = el('div', 'grid');
-    const jokBox = el('div', 'jok');
-    secGrid.append(capGrid, gridBox, jokBox);
+    const poolBox = el('div', 'poker-hand swap-pool');
+    secGrid.append(capGrid, poolBox);
+    const secGive = el('div', 'sec');
+    const giveCount = el('span', 'pick-count', '0 张');
+    const capGive = el('div', 'cap');
+    capGive.append(el('span', null, '我的换出牌'), el('span', 'sp'), giveCount);
+    const giveBox = el('div', 'poker-hand give-picker');
+    secGive.append(capGive, el('div', 'swap-help', '点选要送出的手牌，换入与换出必须等量；点击已选牌可取消。'), giveBox);
 
     /* 目标 */
     const secWant = el('div', 'sec');
     const capWant = el('div', 'cap');
     const wantCount = el('span', 'sub', '0 张');
-    capWant.append(el('span', null, '我的目标'), el('span', 'sp'), wantCount);
+    capWant.append(el('span', null, '已选换入'), el('span', 'sp'), wantCount);
     const wantBox = el('div', 'chips');
     secWant.append(capWant, wantBox);
 
@@ -4300,7 +5378,7 @@
     const btnForgePlay = el('button', 'primary', '换牌并出牌');
     const btnRevert = el('button', null, '撤销');
     const btnClear = el('button', 'ghost', '清空');
-    const btnMineAll = el('button', 'ghost', '我的牌全选');
+    const btnMineAll = el('button', 'ghost', '清空换出');
     const btnRefresh = el('button', 'ghost', '刷新');
     acts.append(btnForge, btnForgePlay, btnRevert, btnClear, btnMineAll, btnRefresh);
 
@@ -4310,14 +5388,14 @@
     const eyesCount = el('span', 'sub', '');
     capEyes.append(el('span', null, '四家手牌（透视）'), el('span', 'sp'), eyesCount);
     const eyesBox = el('div', 'eyes');
-    secEyes.append(capEyes, eyesBox);
+    secEyes.append(capEyes, el('div', 'eyes-legend', '金色框：炸弹 / 王炸　青色框：同花顺　紫底：逢人配'), eyesBox);
 
     /* 提示 */
     const secHint = el('div', 'sec');
     const hintBox = el('div', 'hint', '进入牌桌后自动识别。');
     secHint.append(hintBox);
 
-    bd.append(secStatus, secDeal, secAi, secRec, secPreset, secGrid, secWant, secPlan, acts, secEyes, secHint);
+    bd.append(secStatus, secAi, secRec, secEyes, secGrid, secWant, secGive, secPlan, acts, secHint);
 
     if (host && host.appendChild) host.appendChild(wrap);
 
@@ -4334,6 +5412,8 @@
       phaseText: '',
       counts: {},
       mine: [],
+      pool: [],
+      handGroups: {},
       holes: [],
       owners: {},
       deck: [],
@@ -4345,13 +5425,13 @@
       raw: null
     };
     const selected = new Set();
-    let groups = {};       // 'suit:rank' → [{id, owner}]
-    let presetList = [];
+    const giveSelected = new Set();
+    let planValid = false;
     let minimized = false;
     let eyesOpen = true;
 
     function emit(name, payload) { if (typeof o.onAction === 'function') o.onAction(name, payload); }
-    function changed() { if (typeof o.onChange === 'function') o.onChange(Array.from(selected)); }
+    function changed() { if (typeof o.onChange === 'function') o.onChange(Array.from(selected), Array.from(giveSelected)); }
 
     /* ── 渲染：状态行 ── */
     function renderStatus() {
@@ -4373,113 +5453,13 @@
       kvEl.append(t, owner);
     }
 
-    /* ── 渲染：预设 ── */
-    function renderPresets() {
-      clear(presetBox);
-      presetList.forEach(function (p) {
-        const b = el('button', null, p.name || p.id);
-        b.title = (p.cards || []).map(cardText).join(' ');
-        b.addEventListener('click', function () { setSelected(p.cards || []); emit('preset', p); });
-        presetBox.appendChild(b);
-      });
-    }
-
-    /* ── 渲染：网格 ── */
-    function renderGrid() {
-      clear(gridBox);
-      clear(jokBox);
-      if (!state.ok) return;
-      groups = {};
-      state.deck.forEach(function (c) {
-        const k = suitOf(c.id) + ':' + rankOf(c.id);
-        (groups[k] || (groups[k] = [])).push(c);
-      });
-
-      // 表头
-      gridBox.appendChild(el('div', 'hdr', ''));
-      COLS.forEach(function (r) { gridBox.appendChild(el('div', 'hdr', rankText(r))); });
-
-      for (let s = 0; s < 4; s++) {
-        const sl = el('div', 'sl' + (s === 0 || s === 2 ? ' r' : ''), SUITS[s]);
-        gridBox.appendChild(sl);
-        COLS.forEach(function (r) {
-          gridBox.appendChild(makeCell(s, r));
-        });
-      }
-
-      // 王
-      jokBox.appendChild(el('div', 'sl', ''));
-      jokBox.appendChild(makeCell(-1, 16));    // 小王
-      jokBox.appendChild(makeCell(-1, 17));    // 大王
-    }
-
-    function makeCell(suit, rank) {
-      const key = suit + ':' + rank;
-      const list = (groups[key] || []).slice().sort(function (x, y) { return x.id - y.id; });
-      const ids = list.map(function (x) { return x.id; });
-      const picked = ids.filter(function (id) { return selected.has(id); });
-      const cls = ['cell'];
-      const red = rank === 17 || suit === 0 || suit === 2;
-      if (red) cls.push('r');
-      const anyMine = list.some(function (x) { return x.owner === state.mySeat; });
-      if (anyMine) cls.push('mine');
-      if (picked.length) cls.push('sel');
-      if (!list.length) cls.push('dead');
-      const cell = el('button', cls.join(' '), rankText(rank));
-      cell.type = 'button';
-      cell.title = ids.length
-        ? list.map(function (x) {
-          const who = x.owner === 0 ? '无主' : (x.owner === state.mySeat ? '我的' : (state.seatNames[x.owner] || x.owner + '号'));
-          return cardText(x.id) + ' · ' + who;
-        }).join('\n')
-        : '这局没有这张';
-
-      // 副本点
-      if (ids.length > 1 || rank === 17 || rank === 16) {
-        const dots = el('div', 'dots');
-        list.forEach(function (x) {
-          const d = el('i');
-          if (selected.has(x.id)) d.className = 'on';
-          else if (x.owner === state.mySeat) d.className = 'on';
-          else if (x.owner) d.className = 'op';
-          dots.appendChild(d);
-        });
-        cell.appendChild(dots);
-      }
-      // 逢人配
-      if (state.wildIds.indexOf(ids[0]) >= 0) cell.appendChild(el('div', 'star', '★'));
-
-      cell.addEventListener('click', function (ev) {
-        if (!ids.length) return;
-        ev.preventDefault();
-        cycle(ids, +1);
-      });
-      cell.addEventListener('contextmenu', function (ev) {
-        ev.preventDefault();
-        if (!ids.length) return;
-        cycle(ids, -1);
-      });
-      return cell;
-    }
-
-    function cycle(ids, dir) {
-      const cur = ids.filter(function (id) { return selected.has(id); }).length;
-      let next = cur + dir;
-      if (next < 0) next = ids.length;          // 0 → 最后一个（右键从无到满）
-      if (next > ids.length) next = 0;
-      ids.forEach(function (id, i) {
-        if (i < next) selected.add(id); else selected.delete(id);
-      });
-      refreshSelection();
-    }
-
     /* ── 渲染：目标 ── */
     function renderWant() {
       clear(wantBox);
       const arr = Array.from(selected).sort(function (a, b) { return b - a; });
       wantCount.textContent = arr.length + ' 张';
       if (!arr.length) {
-        wantBox.append(el('span', 'sub', '还没选牌 —— 点上面的格子，或用「快捷目标」'));
+        wantBox.append(el('span', 'sub', '请从上方的已出牌中选择换入牌'));
         return;
       }
       arr.forEach(function (id) {
@@ -4493,12 +5473,12 @@
 
     function setSelected(cards) {
       selected.clear();
-      (cards || []).forEach(function (c) { if (Number(c) > 0) selected.add(Number(c)); });
+      (cards || []).forEach(function (c) { if (state.pool.indexOf(Number(c)) >= 0) selected.add(Number(c)); });
       refreshSelection();
     }
 
     function refreshSelection() {
-      renderGrid();
+      renderPickers();
       renderWant();
       changed();
     }
@@ -4506,36 +5486,25 @@
     /* ── 渲染：计划 ── */
     function renderPlan(plan) {
       clear(planBox);
+      planValid = !!(plan && plan.ok && !plan.noop);
       if (!plan) {
-        planBox.append(el('div', 'hint', '选好牌后这里会显示「拿几张、送几张、风险多少」。'));
-        setBusy(false);
+        planBox.append(el('div', 'hint', '先选已出牌，再选等量的换出手牌。其他人的在手牌不参与交换。'));
+        setBusy(busy);
         return;
       }
       if (!plan.ok) {
         planBox.append(el('div', 'warn', plan.error || '这个目标拿不到'));
-        setBusy(false);
+        setBusy(busy);
         return;
       }
       const gained = plan.gained || [];
       const given = plan.given || [];
       const keep = plan.keep || [];
-      addLine('拿', gained.length ? gained.map(cardText).join(' ') : '—');
-      addLine('已在我手', keep.length ? keep.map(cardText).join(' ') : '—');
-      addLine('送出', given.length ? given.map(cardText).join(' ') : '不送牌（取暗池）');
-      const st = plan.stats || {};
-      addLine('构成', ['暗池 ' + (st.freeGain || 0), '重复副本 ' + (st.twinGain || 0), '等价交换 ' + (st.swapGain || 0)].join(' · '));
-      if (plan.donors && plan.donors.length) {
-        addLine('对手', plan.donors.map(function (d) {
-          const nm = state.seatNames[d.seat] || (d.seat + '号');
-          return nm + ' −' + (d.got || []).length + '/' + '+' + (d.gave || []).length;
-        }).join(' · '));
-      }
-      const rk = plan.risk || { level: 'unknown', text: '—' };
-      const chip = el('div', 'risk ' + (rk.level || 'unknown'), '隐蔽性：' + (rk.text || '—'));
-      if (rk.reasons && rk.reasons.length) chip.title = rk.reasons.join('\n');
-      planBox.appendChild(chip);
-      (plan.notes || []).forEach(function (n) { planBox.appendChild(el('div', 'hint', '· ' + n)); });
-      setBusy(false);
+      addLine('换入', gained.length ? gained.map(cardText).join(' ') : '—');
+      addLine('换出', given.length ? given.map(cardText).join(' ') : '—');
+      addLine('来源', '仅已出牌；其他玩家在手牌不变');
+      (plan.notes || []).forEach(function (n) { planBox.appendChild(el('div', 'hint', n)); });
+      setBusy(busy);
     }
 
     function addLine(k, v) {
@@ -4547,61 +5516,80 @@
     function renderAudit(res) {
       if (!res) return;
       const n = el('div', 'audit ' + (res.ok ? 'ok' : 'bad'),
-        res.ok ? '✓ 自洽检查通过（' + (res.touched || []).length + ' 张变动，别人看不出来）'
+        res.ok ? '✓ 自洽检查通过（' + (res.touched || []).length + ' 张变动，数量与归属校验）'
           : '✗ 检查不通过：' + (res.problems || []).join('；'));
       planBox.appendChild(n);
     }
 
-    /* ── 渲染：透视 ── */
+    function naturalGroups(cards) {
+      const ranks = {};
+      cards.forEach(function (id) { (ranks[rankOf(id)] || (ranks[rankOf(id)] = [])).push(id); });
+      return Object.keys(ranks).map(Number).sort(function (a, b) { return b - a; }).map(function (r) { return { cards: ranks[r], kind: 'rank', label: '' }; });
+    }
+
+    function drawCards(box, groups, picks, onPick) {
+      clear(box);
+      groups.forEach(function (g) {
+        const group = el('div', 'poker-combo ' + g.kind);
+        group.title = (g.label ? g.label + '：' : '') + g.cards.map(cardText).join(' ');
+        if (g.label) group.appendChild(el('span', 'combo-label', g.label));
+        naturalGroups(g.cards).forEach(function (col) {
+          const stack = el('div', 'card-stack');
+          stack.style.height = (52 + Math.max(0, col.cards.length - 1) * 20) + 'px';
+          col.cards.forEach(function (id, i) {
+            const joker = rankOf(id) >= 16;
+            const wild = state.kind === 'gd' && baseOf(id) === idOf(2, state.level);
+            const card = el(onPick ? 'button' : 'div', 'poker-card' + (isRed(id) ? ' red' : '') + (joker ? ' joker' : '') + (wild ? ' wild' : '') + (state.holes.indexOf(id) >= 0 ? ' hole' : '') + (onPick ? ' pick' : '') + (picks && picks.has(id) ? ' chosen' : ''));
+            card.style.top = (i * 20) + 'px';
+            card.setAttribute('data-card', String(id));
+            card.title = cardText(id) + ' · 第' + (id > 54 ? '2' : '1') + '副 · ID ' + id + (wild ? ' · 逢人配' : '') + (state.holes.indexOf(id) >= 0 ? ' · 底牌' : '');
+            card.setAttribute('aria-label', card.title);
+            card.append(el('span', 'rank', rankText(rankOf(id))), el('span', 'suit', joker ? '★' : SUITS[suitOf(id)]));
+            if (onPick) {
+              card.type = 'button';
+              card.setAttribute('aria-pressed', picks.has(id) ? 'true' : 'false');
+              card.addEventListener('click', function () { if (!busy) onPick(id); });
+            }
+            stack.appendChild(card);
+          });
+          group.appendChild(stack);
+        });
+        box.appendChild(group);
+      });
+    }
+
+    function renderPickers() {
+      drawCards(poolBox, naturalGroups(state.pool), selected, function (id) { if (selected.has(id)) selected.delete(id); else selected.add(id); refreshSelection(); });
+      if (!state.pool.length) poolBox.appendChild(el('div', 'hint', '还没有已出牌。底牌、暗池和任何人的在手牌均不作为换入来源。'));
+      drawCards(giveBox, naturalGroups(state.mine), giveSelected, function (id) { if (giveSelected.has(id)) giveSelected.delete(id); else giveSelected.add(id); refreshSelection(); });
+      giveCount.textContent = giveSelected.size + ' 张 / 换入 ' + selected.size + ' 张';
+    }
+
     function renderEyes() {
       clear(eyesBox);
-      if (!state.ok) return;
+      secEyes.style.display = eyesOpen ? '' : 'none';
+      if (!state.ok || !eyesOpen) return;
       let total = 0;
-      for (let s = 1; s <= state.seats; s++) total += (state.counts[s] || 0);
-      eyesCount.textContent = total + ' 张在场';
-      const show = eyesOpen;
-      secEyes.style.display = show ? '' : 'none';
-      if (!show) return;
       for (let s = 1; s <= state.seats; s++) {
+        const hands = state.handsAll && state.handsAll[s] || [];
+        total += hands.length;
         const row = el('div', 'hh');
-        const nm = el('div', 'nm' + (s === state.mySeat ? ' me' : ''), (state.seatNames[s] || s + '号') + ' ' + (state.counts[s] || 0));
-        const hands = state.handsAll && state.handsAll[s] ? state.handsAll[s] : [];
-        const cd = el('div', 'cd', hands.length ? hands.slice().sort(function (a, b) { return b - a; }).map(function (id) {
-          return (state.holes.indexOf(id) >= 0 ? '底' : '') + cardText(id);
-        }).join(' ') : '—');
+        const nm = el('div', 'nm' + (s === state.mySeat ? ' me' : ''), (state.seatNames[s] || s + '号') + ' ' + hands.length + ' 张');
+        const cd = el('div', 'poker-hand');
+        drawCards(cd, state.handGroups[s] || naturalGroups(hands));
+        if (!hands.length) cd.appendChild(el('span', 'sub', '已出完'));
         row.append(nm, cd);
         eyesBox.appendChild(row);
       }
+      eyesCount.textContent = total + ' 张在场';
     }
 
     /* ════════════════════════════ 开局预设 / AI / 记牌 ════════════════════════════ */
 
-    let dealCardsSel = [];     // 开局预设要的牌
-    let dealAuto = false;      // 每局自动执行
     let aiAutoOn = false;      // AI 托管
     let recOpen = false;       // 记牌器明细展开
 
     function pcOf(card, cls) { return el('span', 'pc' + (cls ? ' ' + cls : ''), cardText(card)); }
-
-    function renderDeal() {
-      clear(dealCards);
-      if (!dealCardsSel.length) {
-        dealCards.style.display = 'none';
-        dealNone.style.display = '';
-      } else {
-        dealCards.style.display = '';
-        dealNone.style.display = 'none';
-        dealCardsSel.forEach(function (id) { dealCards.appendChild(pcOf(id)); });
-      }
-      btnDealToggle.className = 'mini' + (dealAuto ? ' on' : '');
-      btnDealToggle.textContent = dealAuto ? '每局自动 · 开' : '每局自动';
-      dealFlag.textContent = dealAuto
-        ? (dealCardsSel.length ? '开 · ' + dealCardsSel.length + ' 张' : '开 · 待选牌')
-        : '未启用';
-      dealFlag.className = 'sub' + (dealAuto ? ' turn-on' : '');
-      btnDealSave.disabled = !selected.size || busy;
-      btnDealSave.title = selected.size ? '把当前选中的牌存为开局预设' : '先在下面选牌';
-    }
 
     function renderAi(ai) {
       const a = ai || {};
@@ -4644,16 +5632,13 @@
       recCaret.textContent = recOpen ? '▾' : '▸';
     }
 
-    function delayMs() {
-      const v = Number(dealDelay.value);
-      return isFinite(v) ? Math.max(0, Math.min(3000, Math.round(v))) : 260;
-    }
-
     /* ── 按钮忙碌态 ── */
     let busy = false;
     function setBusy(v) {
       busy = !!v;
-      [btnForge, btnForgePlay, btnRevert, btnClear, btnMineAll, btnRefresh, btnDealSave].forEach(function (b) { b.disabled = busy; });
+      [btnRevert, btnClear, btnMineAll, btnRefresh].forEach(function (b) { b.disabled = busy; });
+      btnForge.disabled = busy || !planValid || !state.ok;
+      btnForgePlay.disabled = btnForge.disabled || !state.isMyTurn;
       if (busy) btnAiPlay.disabled = true;
       else btnAiPlay.disabled = !(state.ai && state.ai.cards && state.ai.cards.length && state.isMyTurn && state.ok);
     }
@@ -4663,26 +5648,11 @@
     btnForge.addEventListener('click', function () { if (!busy) emit('forge', Array.from(selected)); });
     btnForgePlay.addEventListener('click', function () { if (!busy) emit('forge-play', Array.from(selected)); });
     btnRevert.addEventListener('click', function () { if (!busy) emit('revert'); });
-    btnClear.addEventListener('click', function () { selected.clear(); refreshSelection(); emit('clear'); });
+    btnClear.addEventListener('click', function () { selected.clear(); giveSelected.clear(); refreshSelection(); emit('clear'); });
     btnMineAll.addEventListener('click', function () {
-      setSelected(state.mine || []);
+      giveSelected.clear(); refreshSelection();
     });
     btnRefresh.addEventListener('click', function () { emit('refresh'); });
-
-    btnDealSave.addEventListener('click', function () {
-      const cards = Array.from(selected);
-      if (!cards.length) { emit('toast', '先在下面选几张牌'); return; }
-      dealCardsSel = cards;
-      dealAuto = true;
-      renderDeal();
-      emit('deal-set', { cards: dealCardsSel, auto: dealAuto, delay: delayMs() });
-    });
-    btnDealToggle.addEventListener('click', function () {
-      dealAuto = !dealAuto;
-      renderDeal();
-      emit('deal-auto', { auto: dealAuto, cards: dealCardsSel, delay: delayMs() });
-    });
-    dealDelay.addEventListener('change', function () { emit('deal-delay', delayMs()); });
 
     btnAiPlay.addEventListener('click', function () {
       if (!busy) emit('ai-play', (state.ai && state.ai.cards) || []);
@@ -4746,25 +5716,22 @@
 
     function update(s) {
       Object.assign(state, s || {});
+      if (!state.ok) { state.pool = []; state.mine = []; state.handsAll = {}; state.handGroups = {}; }
       if (tagEl) {
         tagEl.textContent = state.label || (state.kind === 'ddz' ? '斗地主' : '掼蛋');
         tagEl.className = 'tag' + (state.kind === 'ddz' ? ' ddz' : '');
       }
-      if (state.presets) { presetList = state.presets; renderPresets(); }
       renderStatus();
-      renderGrid();
+      selected.forEach(function (id) { if (state.pool.indexOf(id) < 0) selected.delete(id); });
+      giveSelected.forEach(function (id) { if (state.mine.indexOf(id) < 0) giveSelected.delete(id); });
+      renderPickers();
       renderWant();
       renderEyes();
-      if (state.deal) {
-        if (Array.isArray(state.deal.cards)) dealCardsSel = state.deal.cards.slice();
-        if (typeof state.deal.auto === 'boolean') dealAuto = state.deal.auto;
-        if (state.deal.delay != null) dealDelay.value = String(state.deal.delay);
-      }
-      renderDeal();
       if (state.ai) renderAi(state.ai);
       if (state.rec) renderRec(state.rec);
       if (state.hint) hintBox.textContent = state.hint;
-      btnForgePlay.disabled = !(state.isMyTurn && state.ok);
+      changed();
+      setBusy(busy);
       btnForgePlay.title = state.isMyTurn ? '换完立刻出牌' : '不是你的回合（仍可只换牌）';
       btnAiPlay.disabled = !(state.isMyTurn && state.ok && state.ai && state.ai.cards && state.ai.cards.length);
     }
@@ -4780,13 +5747,11 @@
       renderRec: renderRec,
       setSelected: setSelected,
       getSelected: function () { return Array.from(selected); },
-      getDeal: function () { return { cards: dealCardsSel.slice(), auto: dealAuto, delay: delayMs() }; },
-      setDeal: function (d) {
-        d = d || {};
-        if (Array.isArray(d.cards)) dealCardsSel = d.cards.slice();
-        if (typeof d.auto === 'boolean') dealAuto = d.auto;
-        if (d.delay != null) dealDelay.value = String(d.delay);
-        renderDeal();
+      getGive: function () { return Array.from(giveSelected); },
+      setGive: function (cards) {
+        giveSelected.clear();
+        (cards || []).forEach(function (id) { if (state.mine.indexOf(id) >= 0) giveSelected.add(id); });
+        refreshSelection();
       },
       isAiAuto: function () { return aiAutoOn; },
       setAiAuto: function (v) { aiAutoOn = !!v; renderAi(state.ai); },
@@ -4797,7 +5762,6 @@
         hintBox.className = 'hint' + (cls ? ' ' + cls : '');
         setTimeout(function () { hintBox.textContent = old; hintBox.className = 'hint'; }, 2600);
       },
-      setPresets: function (list) { presetList = list; renderPresets(); },
       show: show,
       hide: hide,
       toggle: toggle,
@@ -4913,10 +5877,11 @@
     let lastSig = '';
     let snapshot = null;      // 换牌前的 raw（撤销 / 自动回滚用）
     let snapshotAt = 0;
+    let snapshotAfter = null;
+    let snapshotVersion = -1;
     let dealPlan = [];        // 开局预设：每局发牌瞬间要变成的牌
     let dealAuto = false;
     let dealDelay = 260;
-    let dealFiredVer = -1;    // 这一版已经自动执行过
     let aiAuto = false;       // AI 托管
     let aiPlayedSig = '';     // 托管已出手的回合签名
     let aiCache = { sig: '', v: null };
@@ -4957,9 +5922,12 @@
       if (!Object.keys(names).length) for (let s = 1; s <= seats; s++) names[s] = DG.seatName(s, ctx.mySeat, seats);
 
       const handsAll = {};
-      for (let s = 1; s <= seats; s++) handsAll[s] = v.hands[s] || [];
+      const handGroups = {};
+      for (let s = 1; s <= seats; s++) {
+        handsAll[s] = v.hands[s] || [];
+        handGroups[s] = DG.handGroups(handsAll[s], ctx.kind, v.level, seats);
+      }
 
-      const presetList = DG.presets(ctx.kind, v.level) || [];
       return {
         ok: true,
         kind: ctx.kind,
@@ -4968,6 +5936,8 @@
         mySeat: ctx.mySeat,
         seatNames: names,
         handsAll: handsAll,
+        handGroups: handGroups,
+        pool: DG.playedPool(ctx.raw, { seats: seats }),
         phase: v.phase,
         phaseText: v.phase,
         counts: v.counts,
@@ -4980,10 +5950,8 @@
         isOwner: !!(ctx.props.room && ctx.props.room.position === ctx.props.room.owner),
         isMyTurn: v.phase === 'play' && v.currentPlayer === ctx.mySeat,
         canDeal: !!(ctx.props.room && ctx.props.room.state === 0),
-        presets: presetList,
         ai: aiInfo(ctx),
         rec: recInfo(ctx),
-        deal: { cards: dealPlan.slice(), auto: dealAuto, delay: dealDelay },
         hint: ''
       };
     }
@@ -5004,7 +5972,7 @@
         if (!raw) return;
         const o = JSON.parse(raw) || {};
         if (Array.isArray(o.cards)) dealPlan = o.cards.map(Number).filter(function (c) { return c > 0; });
-        if (typeof o.auto === 'boolean') dealAuto = o.auto;
+        dealAuto = false;
         if (o.delay != null) dealDelay = Math.max(0, Math.min(3000, Number(o.delay) || 260));
       } catch (e) { /* ignore */ }
     }
@@ -5013,34 +5981,6 @@
       try {
         if (win) win.localStorage.setItem('dg.deal', JSON.stringify({ cards: dealPlan, auto: dealAuto, delay: dealDelay }));
       } catch (e) { /* ignore */ }
-    }
-
-    /** 预设是否已经在我手上（换成功了就不该再换） */
-    function dealSatisfied(ctx) {
-      if (!dealPlan.length) return true;
-      const mine = {};
-      (ctx.view.hands[ctx.mySeat] || []).forEach(function (c) { mine[c] = 1; });
-      for (let i = 0; i < dealPlan.length; i++) if (!mine[dealPlan[i]]) return false;
-      return true;
-    }
-
-    /** 到了「新一局刚发完牌」且预设开启 → 延迟一点点就改，别人第一眼看到的就是这套牌 */
-    function maybeAutoDeal(ctx) {
-      if (!dealAuto || !dealPlan.length) return false;
-      if (!newRoundOf(ctx)) return false;
-      if (dealSatisfied(ctx)) return false;
-      const ver = Number(ctx.props.game && ctx.props.game.version) || 0;
-      if (ver === dealFiredVer) return false;
-      dealFiredVer = ver;
-      const cards = dealPlan.slice();
-      const wait = Math.max(0, dealDelay);
-      setTimeout(function () {
-        if (!read()) return;
-        if (dealSatisfied(read())) return;
-        forge(cards, false);
-        toast('开局预设已生效（' + cards.length + ' 张）');
-      }, wait);
-      return true;
     }
 
     /* ── AI 建议 ── */
@@ -5104,7 +6044,7 @@
       }
       const v = ctx.view;
       lastVer = Number(ctx.props.game && ctx.props.game.version) || 0;
-      maybeAutoDeal(ctx);
+      // 仅从已出牌交换：开局预设停用，不再自动改发牌。
       const sig = [v.state, v.played.length, v.counts[1], v.counts[2], v.counts[3], v.counts[4] || 0,
         lastVer, ctx.kind, ctx.mySeat].join('|');
       // AI 托管：轮到我且还没为这一版出过手
@@ -5141,20 +6081,20 @@
       const plan = DG.plan(ctx.raw, cards, {
         mySeat: ctx.mySeat,
         seats: ctx.seats,
-        allowHole: !!opts.allowHole,
-        preferPool: true
+        give: Array.isArray(opts.give) ? opts.give : (ui ? ui.getGive() : [])
       });
       if (ui) ui.renderPlan(plan);
       if (!plan.ok) { toast(plan.error || '这个目标拿不到'); return; }
-      if (plan.noop) { toast('这些牌本来就在你手上'); return; }
+      if (plan.noop) { toast('请先选择换入和换出牌'); return; }
 
       const forged = DG.applyPlan(ctx.raw, plan);
-      const poolUsed = (plan.stats && plan.stats.freeGain) > 0;
-      const chk = DG.audit(ctx.raw, forged, { seats: ctx.seats, allowPool: poolUsed });
+      const chk = DG.audit(ctx.raw, forged, { seats: ctx.seats, mySeat: ctx.mySeat });
       if (ui) ui.renderAudit(chk);
       if (!chk.ok) { toast('自检没通过，已中止：' + chk.problems[0]); return; }
 
+      snapshotVersion = Number(ctx.props.game.version) || 0;
       snapshot = ctx.raw;
+      snapshotAfter = forged;
       snapshotAt = Date.now();
       busy = true;
       if (ui) ui.setBusy(true);
@@ -5167,8 +6107,9 @@
         busy = false;
         if (ui) ui.setBusy(false);
         if (!ok) {
-          toast('服务器没接受这次改动（版本冲突），已还原');
-          if (snapshot) { try { sendUpdate(snapshot); } catch (e) { /* ignore */ } }
+          toast('服务器未确认此次交换；保留当前牌局，请刷新重选');
+          // 广播已前进时不把旧局面覆盖回去。
+          snapshot = null; snapshotAfter = null;
           return;
         }
         toast('换牌成功：' + want.map(DG.cardText).join(' ') + '（' + sent + ' 字节）');
@@ -5182,6 +6123,7 @@
       (function poll() {
         const ctx = read();
         if (ctx && DG.rawEqual(ctx.raw, target)) { done(true); return; }
+        if (!ctx || (Number(ctx.props.game.version) || 0) !== snapshotVersion || !DG.rawEqual(ctx.raw, snapshot)) { done(false); return; }
         if (Date.now() - t0 > 1200) {
           if (attempt < 1) { retry(target, attempt + 1, done); return; }
           done(false);
@@ -5219,8 +6161,11 @@
 
     /* ── 撤销 ── */
     function revert() {
+      if (busy) return;
       if (!snapshot) { toast('没有可撤销的改动'); return; }
       if (Date.now() - snapshotAt > 60000) { toast('快照太旧（>60s），直接刷新吧'); return; }
+      const now = read();
+      if (!now || !snapshotAfter || !DG.rawEqual(now.raw, snapshotAfter)) { toast('牌局已有后续动作，旧快照已失效'); return; }
       try {
         sendUpdate(snapshot);
         toast('已还原到换牌前');
@@ -5268,40 +6213,22 @@
             aiPlayedSig = '';
             try { if (win) win.localStorage.setItem('dg.aiauto', aiAuto ? '1' : '0'); } catch (e) { /* ignore */ }
             toast(aiAuto ? 'AI 托管：开' : 'AI 托管：关');
-          } else if (name === 'deal-set') {
-            dealPlan = (payload && payload.cards || []).slice();
-            dealAuto = !!(payload && payload.auto);
-            if (payload && payload.delay != null) dealDelay = payload.delay;
-            saveDeal();
-            dealFiredVer = -1;
-            toast('开局预设已保存（' + dealPlan.length + ' 张），下一局生效');
-          } else if (name === 'deal-auto') {
-            dealAuto = !!(payload && payload.auto);
-            if (payload && Array.isArray(payload.cards) && payload.cards.length) dealPlan = payload.cards.slice();
-            if (payload && payload.delay != null) dealDelay = payload.delay;
-            saveDeal();
-            dealFiredVer = -1;
-            toast(dealAuto ? '开局自动改牌：开' : '开局自动改牌：关');
-          } else if (name === 'deal-delay') {
-            dealDelay = Number(payload) || 0;
-            saveDeal();
           }
         },
-        onChange: function (cards) {
+        onChange: function (cards, give) {
           const ctx = read();
           if (!ctx || !ui) return;
-          if (!cards.length) { ui.renderPlan(null); return; }
-          const plan = DG.plan(ctx.raw, cards, { mySeat: ctx.mySeat, seats: ctx.seats, preferPool: true });
+          if (!cards.length && !give.length) { ui.renderPlan(null); return; }
+          const plan = DG.plan(ctx.raw, cards, { mySeat: ctx.mySeat, seats: ctx.seats, give: give });
           ui.renderPlan(plan);
           if (plan.ok && !plan.noop) {
             const forged = DG.applyPlan(ctx.raw, plan);
-            ui.renderAudit(DG.audit(ctx.raw, forged, { seats: ctx.seats, allowPool: (plan.stats && plan.stats.freeGain) > 0 }));
+            ui.renderAudit(DG.audit(ctx.raw, forged, { seats: ctx.seats, mySeat: ctx.mySeat }));
           }
         },
         getPos: function () { return null; },
         setPos: function (p) { try { win.localStorage.setItem('dg.pos', JSON.stringify(p)); } catch (e) { /* ignore */ } }
       });
-      ui.setDeal({ cards: dealPlan, auto: dealAuto, delay: dealDelay });
       ui.setAiAuto(aiAuto);
 
       try {
@@ -5363,11 +6290,9 @@
       setDeal: function (d) {
         d = d || {};
         if (Array.isArray(d.cards)) dealPlan = d.cards.map(Number).filter(function (c) { return c > 0; });
-        if (typeof d.auto === 'boolean') dealAuto = d.auto;
+        dealAuto = false;
         if (d.delay != null) dealDelay = Math.max(0, Math.min(3000, Number(d.delay) || 0));
         saveDeal();
-        dealFiredVer = -1;
-        if (ui) ui.setDeal({ cards: dealPlan, auto: dealAuto, delay: dealDelay });
       },
       setAiAuto: function (v) {
         aiAuto = !!v;

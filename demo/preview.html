@@ -72,8 +72,8 @@
   <h1>控牌助手 · 界面预览</h1>
   这是用假牌局驱动的真面板：右边那个就是插件的样子。
   <div class="note">
-    · 点格子选牌（左键 +1 副本，右键 −1），或点「快捷目标」<br>
-    · 选完点 <b>存为预设</b> → 以后每局发牌就是这套牌<br>
+    · 透视按点数叠牌；金框是炸弹，青框是同花顺<br>
+    · 在「已出牌换入」与「我的换出牌」各选等量牌<br>
     · <b>换牌</b> = 走页面 <code>PlayerUpdateGameData</code> 通道<br>
     · 面板里还有 <b>🤖 AI 建议</b>、<b>🃏 记牌器</b>、<b>👁 四家透视</b><br>
     · <span class="k">Alt+D</span> 收起/展开面板
@@ -85,6 +85,7 @@
 <script src="../vendor/ddz.core.js"></script>
 <script src="../vendor/gd.core.js"></script>
 <script src="../vendor/gd.ai.js"></script>
+<script src="../vendor/gd.site.core.js"></script>
 <script src="../dg.core.js"></script>
 <script src="../dg.ai.js"></script>
 <script src="../dg.recorder.js"></script>
@@ -121,19 +122,25 @@
   }
 
   function deal() {
-    const cpl = new Array(54).fill(15);
-    const deck = shuffle(Array.from({ length: 54 }, (_, i) => i + 1));
-    let p = 0;
-    for (let s = 1; s <= 3; s++) for (let c = 0; c < 17; c++) cpl[deck[p++] - 1] = s;
-    return { rule: 0, state: 1, landlordId: 0, cardPositionList: cpl, playedCardList: [], v: 1,
-      team13Level: 0, team24Level: 0, lastRankList: [], tributeCardList: [], returnCardList: [],
-      firstPlayer: 0, playedTypeList: [] };
+    const special=[3,16,29,42,31,32,33,34,35,53,54,107,108,13,26,39,52];
+    const cpl=new Array(108).fill(0);
+    const rest=shuffle(Array.from({length:108},(_,i)=>i+1).filter(id=>!special.includes(id)));
+    special.forEach(id=>{cpl[id-1]=1;});
+    for(let seat=1;seat<=4;seat++) {
+      const count=seat===1?27-special.length:27;
+      for(let j=0;j<count;j++)cpl[rest.pop()-1]=seat;
+    }
+    const pool=[cpl.indexOf(2)+1,cpl.indexOf(3)+1];
+    pool.forEach(id=>{cpl[id-1]=0;});
+    return {rule:2,state:4,landlordId:0,cardPositionList:cpl,playedCardList:[0,pool[0],0,0,0,0,pool[1]],v:1,
+      team13Level:2,team24Level:2,lastRankList:[],tributeCardList:[],returnCardList:[],firstPlayer:2,
+      playedTypeList:[GDSite.bestCode([pool[0]],0,2),0,0,0,GDSite.bestCode([pool[1]],0,2)]};
   }
 
   const props = {
     room: {
       position: 1, owner: 9, state: 1, version: 5,
-      playerList: [{ nickname: '我' }, { nickname: 'P2' }, { nickname: 'P3' }]
+      playerList: [{ nickname: '我' }, { nickname: 'P2' }, { nickname: 'P3' }, { nickname: 'P4' }]
     },
     game: { data: DG.encodeGameData(deal()), version: 7 },
     send: function (key, payload) {
@@ -148,7 +155,7 @@
 
   function paint() {
     const raw = DG.decodeGameData(props.game.data);
-    const v = DG.expand(raw, { seats: 3 });
+    const v = DG.expand(raw, { seats: 4 });
     const hand = document.getElementById('hand');
     hand.innerHTML = '';
     DG.sortHand(v.hands[1]).forEach(function (id) {
@@ -160,7 +167,8 @@
     document.getElementById('p1').parentNode.childNodes[1].nodeValue = v.counts[1] + ' 张';
     document.getElementById('p2').parentNode.childNodes[1].nodeValue = v.counts[2] + ' 张';
     document.getElementById('p3').parentNode.childNodes[1].nodeValue = v.counts[3] + ' 张';
-    document.getElementById('p4').parentNode.style.display = 'none';
+    document.getElementById('p4').parentNode.style.display = '';
+    document.getElementById('p4').parentNode.childNodes[1].nodeValue = v.counts[4] + ' 张';
   }
 
   const ctl = DGSite.create({ DG: DG, DGUi: DGUi, DGAI: window.DGAI, DGRec: window.DGRec, HQ: window.HQ });
@@ -175,7 +183,7 @@
     paint();
   });
 
-  document.getElementById('p4').parentNode.style.display = 'none';
+  document.getElementById('p4').parentNode.style.display = '';
 })();
 </script>
 </body>
