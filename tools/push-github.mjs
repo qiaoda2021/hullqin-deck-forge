@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { getSecret } from './vault.mjs';
+import build from '../build.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OWNER = 'qiaoda2021';
@@ -71,7 +72,7 @@ export async function publish({files, api, head, branch, treeSha, before, expect
   const ref=await api('GET',`${BASE}/git/ref/heads/${encodeURIComponent(branch)}`);
   if(ref.object.sha!==head)throw new Error('Concurrent update detected; branch left unchanged');
   const commit=await api('POST',`${BASE}/git/commits`,{
-    message:'feat: release 2.2.0 stacked cards and played-card exchange',tree:tree.sha,parents:[head]
+    message:'feat: release ' + build.META.version + ' deck-forge update',tree:tree.sha,parents:[head]
   });
   await api('PATCH',refPath,{sha:commit.sha,force:false});
   return {commit:commit.sha,changed:changed.map(f=>f.path)};
@@ -137,7 +138,7 @@ async function main() {
     const current=await api('GET',`${BASE}/git/ref/heads/${encodeURIComponent(branch)}`);
     if(current.object.sha!==result.commit)throw new Error('Branch advanced after upload; fixed commit verified');
     const dist=files.find(f=>f.path.startsWith('dist/'));
-    console.log(JSON.stringify({...result,verifiedFiles:files.length,version:'2.2.0',distSHA256:sha256(dist.content),
+    console.log(JSON.stringify({...result,verifiedFiles:files.length,version:build.META.version,distSHA256:sha256(dist.content),
       url:`https://github.com/${OWNER}/${REPO}/commit/${result.commit}`}));
   } catch(e) {
     const msg=String(e.message||e);

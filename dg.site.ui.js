@@ -354,6 +354,23 @@
     const btnRefresh = el('button', 'ghost', '刷新');
     acts.append(btnForge, btnForgePlay, btnRevert, btnClear, btnMineAll, btnRefresh);
 
+    /* 下一把预设：与本局已出牌交换分开。 */
+    const secNext = el('div', 'sec next-deal');
+    const nextStatus = el('div', 'hint next-status', '未设置下一把');
+    const nextToggle = el('button', 'mini next-toggle', '选择下一把手牌 ▸');
+    nextToggle.setAttribute('aria-expanded', 'false');
+    const nextBody = el('div', 'next-body'); nextBody.style.display = 'none';
+    const nextHelp = el('div', 'swap-help', '仅下一局生效；可选部分或全部初始手牌，其余保留原发牌。下局可重排底牌/暗池的牌面但保留张数；地主仍由叫分流程决定。');
+    const nextPicker = el('div', 'poker-hand next-picker');
+    const nextCount = el('div', 'pick-count next-count');
+    const nextActions = el('div', 'row');
+    const nextArm = el('button', 'mini go next-arm', '设为下一把');
+    const nextClear = el('button', 'mini', '清空选择');
+    const nextCancel = el('button', 'mini next-cancel', '取消预设');
+    nextActions.append(nextArm, nextClear, nextCancel);
+    nextBody.append(nextHelp, nextCount, nextPicker, nextActions);
+    secNext.append(el('div', 'cap', '下一把初始手牌（一次性）'), nextStatus, nextToggle, nextBody);
+
     /* 透视 */
     const secEyes = el('div', 'sec');
     const capEyes = el('div', 'cap');
@@ -367,7 +384,7 @@
     const hintBox = el('div', 'hint', '进入牌桌后自动识别。');
     secHint.append(hintBox);
 
-    bd.append(secStatus, secAi, secRec, secEyes, secGrid, secWant, secGive, secPlan, acts, secHint);
+    bd.append(secStatus, secAi, secRec, secNext, secEyes, secGrid, secWant, secGive, secPlan, acts, secHint);
 
     if (host && host.appendChild) host.appendChild(wrap);
 
@@ -398,6 +415,10 @@
     };
     const selected = new Set();
     const giveSelected = new Set();
+    const nextSelected = new Set();
+    const nextDrafts = {};
+    let nextDraftKey = '';
+    let nextOpen = false;
     let planValid = false;
     let minimized = false;
     let eyesOpen = true;
@@ -423,6 +444,7 @@
       const t = el('span', state.isMyTurn ? 'turn-on' : 'turn-off', state.isMyTurn ? '轮到我' : '等别人');
       const owner = el('span', state.isOwner ? null : 'sub', state.isOwner ? '房主' : '非房主');
       kvEl.append(t, owner);
+      if (state.kind === 'gd') kvEl.append(el('b', 'current-level', '本局打 ' + rankText(state.level) + ' · 逢人配 ♥' + rankText(state.level)));
     }
 
     /* ── 渲染：目标 ── */
@@ -530,6 +552,24 @@
       });
     }
 
+    function renderNextDeal() {
+      const key = state.kind + ':' + state.seats;
+      if (nextDraftKey !== key) {
+        if (nextDraftKey) nextDrafts[nextDraftKey] = Array.from(nextSelected);
+        nextDraftKey = key; nextSelected.clear();
+        (nextDrafts[key] || (state.nextDeal && state.nextDeal.cards) || []).forEach(function (id) { nextSelected.add(id); });
+      }
+      const max = state.kind === 'gd' ? 27 : (state.seats >= 4 ? 25 : 17);
+      nextStatus.textContent = state.ok ? ((state.nextDeal && state.nextDeal.status) || '未设置下一把') : '进房坐下后可设置下一把';
+      nextCount.textContent = '已选 ' + nextSelected.size + ' / ' + max + ' 张（' + (state.kind === 'gd' ? '掼蛋' : state.seats + '人斗地主') + '）';
+      nextArm.disabled = busy || !state.ok || !state.mySeat || !nextSelected.size || nextSelected.size > max;
+      nextClear.disabled = busy; nextCancel.disabled = busy || !(state.nextDeal && state.nextDeal.armed);
+      if (nextOpen) drawCards(nextPicker, naturalGroups(state.deck.map(function (c) { return c.id; })), nextSelected, function (id) {
+        if (nextSelected.has(id)) nextSelected.delete(id); else nextSelected.add(id);
+        renderNextDeal();
+      });
+    }
+
     function renderPickers() {
       drawCards(poolBox, naturalGroups(state.pool), selected, function (id) { if (selected.has(id)) selected.delete(id); else selected.add(id); refreshSelection(); });
       if (!state.pool.length) poolBox.appendChild(el('div', 'hint', '还没有已出牌。底牌、暗池和任何人的在手牌均不作为换入来源。'));
@@ -608,6 +648,7 @@
     let busy = false;
     function setBusy(v) {
       busy = !!v;
+      renderNextDeal();
       [btnRevert, btnClear, btnMineAll, btnRefresh].forEach(function (b) { b.disabled = busy; });
       btnForge.disabled = busy || !planValid || !state.ok;
       btnForgePlay.disabled = btnForge.disabled || !state.isMyTurn;
@@ -616,6 +657,15 @@
     }
 
     /* ════════════════════════════ 交互 ════════════════════════════ */
+
+    nextToggle.addEventListener('click', function () {
+      nextOpen = !nextOpen; nextBody.style.display = nextOpen ? '' : 'none';
+      nextToggle.textContent = nextOpen ? '收起下一把选牌 ▾' : '选择下一把手牌 ▸';
+      nextToggle.setAttribute('aria-expanded', String(nextOpen)); renderNextDeal();
+    });
+    nextArm.addEventListener('click', function () { if (!nextArm.disabled) emit('next-arm', Array.from(nextSelected)); });
+    nextClear.addEventListener('click', function () { if (!busy) { nextSelected.clear(); renderNextDeal(); } });
+    nextCancel.addEventListener('click', function () { if (!busy) emit('next-cancel'); });
 
     btnForge.addEventListener('click', function () { if (!busy) emit('forge', Array.from(selected)); });
     btnForgePlay.addEventListener('click', function () { if (!busy) emit('forge-play', Array.from(selected)); });
@@ -653,7 +703,7 @@
       bd.style.display = minimized ? 'none' : '';
       panel.style.width = minimized ? '150px' : '442px';
     }
-    function show() { wrap.style.display = ''; setMinimized(false); }
+    function show() { wrap.style.display = ''; setMinimized(false); emit('refresh'); }
     function hide() { wrap.style.display = 'none'; }
     function isVisible() { return wrap.style.display !== 'none'; }
     function toggle() { if (isVisible()) hide(); else show(); }
@@ -690,7 +740,7 @@
       Object.assign(state, s || {});
       if (!state.ok) { state.pool = []; state.mine = []; state.handsAll = {}; state.handGroups = {}; }
       if (tagEl) {
-        tagEl.textContent = state.label || (state.kind === 'ddz' ? '斗地主' : '掼蛋');
+        tagEl.textContent = (state.label || (state.kind === 'ddz' ? '斗地主' : '掼蛋')) + (state.ok && state.kind === 'gd' ? ' · 打 ' + rankText(state.level) : '');
         tagEl.className = 'tag' + (state.kind === 'ddz' ? ' ddz' : '');
       }
       renderStatus();
@@ -720,6 +770,12 @@
       setSelected: setSelected,
       getSelected: function () { return Array.from(selected); },
       getGive: function () { return Array.from(giveSelected); },
+      getNextSelected: function () { return Array.from(nextSelected); },
+      setNextSelected: function (cards) {
+        nextSelected.clear();
+        (cards || []).forEach(function (id) { if (state.deck.some(function (c) { return c.id === id; })) nextSelected.add(id); });
+        renderNextDeal();
+      },
       setGive: function (cards) {
         giveSelected.clear();
         (cards || []).forEach(function (id) { if (state.mine.indexOf(id) >= 0) giveSelected.add(id); });

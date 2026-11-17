@@ -183,7 +183,7 @@ group('3. 暗池、底牌和非法历史');
   const pair=makeDeal('gd',4,45);
   pair.cardPositionList[2]=0; pair.cardPositionList[15]=0; pair.playedCardList=[0,3,16]; pair.playedTypeList=[(2<<8)|3];
   pair.cardPositionList[3]=2; pair.cardPositionList[4]=2;
-  ok(!DG.plan(pair,[3],{mySeat:2,give:[4]}).ok,'将历史对子改成杂牌时阻止');
+  ok(DG.plan(pair,[3],{mySeat:2,give:[4]}).ok,'直接交换允许将历史对子改成杂牌');
   pair.cardPositionList[16]=2;
   const good=DG.plan(pair,[3,16],{mySeat:2,give:[4,17]});
   ok(good.ok,'同时换整对时保留原牌型',good.error);
@@ -199,8 +199,8 @@ for (const kind of ['gd', 'ddz']) {
     cardPositionList: Array(kind === 'gd' ? 108 : 54).fill(3),
     playedCardList: [0,3,0,5], playedTypeList: [259,261], team13Level: 2, team24Level: 2 };
   raw.cardPositionList[2] = 0; raw.cardPositionList[4] = 0;
-  ok(!DG.plan(raw,[3],{mySeat:3,seats,give:[6]}).ok,kind+' 前手变大导致后手压不住时拦截');
-  ok(!DG.plan(raw,[5],{mySeat:3,seats,give:[16]}).ok,kind+' 后手变小压不住前手时拦截');
+  ok(DG.plan(raw,[3],{mySeat:3,seats,give:[6]}).ok,kind+' 前手变大导致后手压不住也允许直接交换');
+  ok(DG.plan(raw,[5],{mySeat:3,seats,give:[16]}).ok,kind+' 后手变小也不因历史压牌而阻止交换');
   const p=DG.plan(raw,[3],{mySeat:3,seats,give:[4]});
   ok(p.ok,kind+' 合法3→4且后手5仍能压时允许',p.error);
   const passed={...raw,playedCardList:[0,3,...Array(seats-1).fill(0),0,5],playedTypeList:[]};
@@ -211,10 +211,69 @@ for (const kind of ['gd', 'ddz']) {
 {
   const raw={rule:0,state:1,cardPositionList:Array(108).fill(2),playedCardList:[0,3,16,29,4],playedTypeList:[]};
   [3,16,29,4].forEach(id=>raw.cardPositionList[id-1]=0);
-  ok(!DG.plan(raw,[4],{mySeat:2,seats:4,give:[5]}).ok,'四人模式不使用三人三带一牌型');
+  ok(DG.plan(raw,[4],{mySeat:2,seats:4,give:[5]}).ok,'四人直接交换不以历史三带一牌型拦截');
   ok(!DG.handGroups([53,54],'ddz',2,4).some(g=>g.kind==='bomb'),'四人两王不是王炸');
   ok(!DG.handGroups([53,54,107],'ddz',2,4).some(g=>g.kind==='bomb'),'四人三王不是王炸');
   ok(DG.handGroups([53,54,107,108],'ddz',2,4).some(g=>g.kind==='bomb'&&g.cards.length===4),'四人四王高亮王炸');
+}
+
+group('3.2 当前打级队伍与第20动作误报');
+{
+  const raw={rule:2,state:1,firstPlayer:1,cardPositionList:Array(108).fill(1),playedCardList:[],playedTypeList:[],team13Level:2,team24Level:5,lastRankList:[2,4,1,3]};
+  for(const id of [3,16,29,42])raw.playedCardList.push(0,id,0,0,0);
+  raw.playedCardList.push(0,13,0,0,0,5);
+  for(const id of raw.playedCardList)if(id)raw.cardPositionList[id-1]=0;
+  eq(DG.expand(raw).level,5,'2/4队打级时读取team24Level');
+  eq(DG.expand(raw).level,GDSite.expandState(raw).level,'当前级牌与站点一致');
+  const p=DG.plan(raw,[3],{mySeat:1,seats:4,give:[6]});
+  ok(p.ok,'第20动作级牌5压K不再因读取2误报',p.error);
+  if(p.ok)ok(DG.audit(raw,DG.applyPlan(raw,p),{mySeat:1,seats:4}).ok,'修正级牌后的交换通过独立审计');
+  for(const winner of [1,2,3,4]) {
+    const r={...raw,team13Level:11,team24Level:14,lastRankList:[winner,...[1,2,3,4].filter(s=>s!==winner)]};
+    eq(DG.expand(r).level,winner%2?11:14,'头游'+winner+'决定本局打级队伍');
+    eq(DG.expand(r).level,GDSite.expandState(r).level,'头游'+winner+'读取与站点一致');
+  }
+  eq(DG.expand({...raw,lastRankList:[]}).level,2,'首局按站点规则打2');
+}
+
+group('3.3 直接交换与下局发牌');
+{
+  const raw=makeDeal('gd',4,132);raw.playedCardList=[0,3,16];raw.playedTypeList=[515];
+  raw.cardPositionList[2]=0;raw.cardPositionList[15]=0;raw.cardPositionList[3]=2;
+  const p=DG.plan(raw,[3],{mySeat:2,seats:4,give:[4]});
+  ok(p.ok,'历史对子破坏后仍可直接交换');
+  eq(p.types,[0],'未识别的新历史组合记0而非保留虚假对子');
+  ok(p.notes.some(n=>n.includes('AI')&&n.includes('回放')),'执行前明确提示实际影响');
+  const after=DG.applyPlan(raw,p);
+  ok(DG.audit(raw,after,{mySeat:2,seats:4}).ok,'直接交换保留物理牌与归属审计');
+  eq(DG.revertPlan(after,p),raw,'直接交换仍可完整反向恢复');
+}
+for(const [kind,seats]of [['gd',4],['ddz',2],['ddz',3],['ddz',4]]){
+  const raw=makeDeal(kind,seats,135),saved=clone(raw),view=DG.expand(raw,{seats});
+  if(kind==='ddz')raw.state=0;
+  const want=view.hands[2].slice(0,3);
+  const p=DG.planDeal(raw,want,{mySeat:1,seats});
+  ok(p.ok,kind+seats+' 可调整新发牌',p.error);
+  ok(want.every(id=>DG.expand(p.after,{seats}).hands[1].includes(id)),kind+seats+' 所选物理牌全部到手');
+  eq(Object.values(DG.expand(p.after,{seats}).counts),Object.values(view.counts),kind+seats+' 各家初始张数守恒');
+  eq(p.after.cardPositionList.slice().sort((a,b)=>a-b),raw.cardPositionList.slice().sort((a,b)=>a-b),kind+seats+' 所有归属及底牌标记总量守恒');
+  ok(DG.auditDeal(raw,p.after,{mySeat:1,seats,cards:want}).ok,kind+seats+' 下局调整通过独立边界审计');
+  eq(raw.cardPositionList,saved.cardPositionList,kind+seats+' 规划不改变原发牌');
+  const bad=clone(p.after);bad.state=9;
+  ok(!DG.auditDeal(raw,bad,{mySeat:1,seats,cards:want}).ok,kind+seats+' 审计拦截发牌外的协议改动');
+  ok(!DG.planDeal({...raw,playedCardList:[0,want[0]]},want,{mySeat:1,seats}).ok,kind+seats+' 有历史动作后禁止下局API改本局');
+  ok(!DG.planDeal({...raw,state:9},want,{mySeat:1,seats}).ok,kind+seats+' 已结束的局不应用');
+  ok(!DG.planDeal(raw,[want[0],want[0]],{mySeat:1,seats}).ok,kind+seats+' 重复物理牌拦截');
+  ok(!DG.planDeal(raw,[],{mySeat:1,seats}).ok,kind+seats+' 空选择不应用');
+  ok(!DG.planDeal(raw,Array.from({length:view.handSize+1},(_,i)=>i+1),{mySeat:1,seats}).ok,kind+seats+' 超初始张数拦截');
+  const same=DG.planDeal(raw,view.hands[1].slice(0,2),{mySeat:1,seats});
+  ok(same.ok&&same.noop,kind+seats+' 已有目标不重复发报文');
+  if(kind==='ddz'){
+    const pool=view.unowned.slice(0,2),q=DG.planDeal(raw,pool,{mySeat:1,seats});
+    ok(q.ok&&pool.every(id=>DG.expand(q.after,{seats}).owners[id]===1),kind+seats+' 下局单独支持底牌/暗池重排');
+    eq(DG.expand(q.after,{seats}).holes.length,view.holes.length,kind+seats+' 底牌张数不变');
+    ok(DG.auditDeal(raw,q.after,{mySeat:1,seats,cards:pool}).ok,kind+seats+' 底牌重排仍通过审计');
+  }
 }
 
 group('4. 扑克牌分组与高亮');

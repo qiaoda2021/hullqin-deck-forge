@@ -145,7 +145,10 @@
   }
 
   function levelOf(raw) {
-    const lv = Math.floor(Number(raw && raw.team13Level) || 2);
+    const ranks = raw && Array.isArray(raw.lastRankList) ? raw.lastRankList : [];
+    // 与站点一致：上一局头游所在队伍决定本局打级；首局打 2。
+    const value = ranks.length === 4 ? (Number(ranks[0]) % 2 === 1 ? raw.team13Level : raw.team24Level) : 2;
+    const lv = Math.floor(Number(value) || 2);
     return Math.min(14, Math.max(2, lv));
   }
 
@@ -281,51 +284,28 @@
     return Array.isArray(cards) && cards.every(function (id) { return Number.isInteger(id) && id > 0 && id <= total; }) && new Set(cards).size === cards.length;
   }
 
-  /** 用换出的牌替代历史中的换入牌，保留动作分隔和牌型；改变牌型则整体中止。 */
+  /** 直接交换只替换物理牌槽位；历史牌型变化只提示，不作为发送门禁。 */
   function exchangeHistory(raw, incoming, outgoing, view) {
     const map = new Map(incoming.map(function (id, i) { return [id, outgoing[i]]; }));
-    const history = (raw.playedCardList || []).map(function (id) { return map.has(id) ? map.get(id) : id; });
-    const types = (raw.playedTypeList || []).slice();
     const old = raw.playedCardList || [];
     if (old.length && old[0] !== 0) throw new Error('出牌流水缺少动作分隔');
-    let segment = -1;
-    let start = 0;
+    const history = old.map(function (id) { return map.has(id) ? map.get(id) : id; });
+    const types = (raw.playedTypeList || []).slice();
+    const affected = [];
+    let segment = -1, start = 0;
     for (let i = 0; i <= old.length; i++) {
       if (i < old.length && old[i] !== 0) continue;
-      if (segment >= 0) {
-        const prev = old.slice(start, i);
-        const next = history.slice(start, i);
-        if (prev.some(function (id) { return map.has(id); })) {
-          if (view.kind === 'gd') {
-            const code = Number(types[segment]) || GD.bestCode(prev, 0, view.level);
-            const candidates = GD.interpretCodes(next, view.level).filter(function (c) { return (c >> 8) === (code >> 8); });
-            if (!candidates.length) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
-            types[segment] = candidates.indexOf(code) >= 0 ? code : candidates[candidates.length - 1];
-          } else {
-            const a = DDZ.parseCards(view.seats < 4, prev);
-            const b = DDZ.parseCards(view.seats < 4, next);
-            if (!a[0] || a[0] !== b[0]) throw new Error('所选换出牌会破坏第 ' + (segment + 1) + ' 手的原牌型，请调整换出牌');
-          }
-        }
-        if (next.length) {
-          // 复用站点回放确定当前墩；逐手检查，防止改小前手或改大后被压牌。
-          const prefix = history.slice(0, start - 1);
-          let legal;
-          if (view.kind === 'gd') {
-            const rep = GD.replayActions(prefix, raw.firstPlayer || 1, types);
-            const prevCode = rep.lastInterp || GD.bestCode(rep.lastCards, 0, view.level);
-            const code = Number(types[segment]) || GD.bestCode(next, 0, view.level);
-            legal = GD.interpretCodes(next, view.level).indexOf(code) >= 0 && GD.beats(code, prevCode);
-          } else {
-            const rep = DDZ.expandState(Object.assign({}, raw, { playedCardList: prefix }), view.seats);
-            legal = DDZ.canBeat(view.seats < 4, next, rep.lastCards);
-          }
-          if (!legal) throw new Error('第 ' + (segment + 1) + ' 手不符合牌型或连续压牌关系，请调整换出牌');
+      if (segment >= 0 && old.slice(start, i).some(function (id) { return map.has(id); })) {
+        affected.push(segment + 1);
+        if (view.kind === 'gd') {
+          while (types.length <= segment) types.push(0);
+          // shortcut: 无法识别的新历史牌组记为0；不承诺历史回放或当前墩仍可按原规则继续。
+          types[segment] = GD.bestCode(history.slice(start, i), 0, view.level);
         }
       }
       if (i < old.length) { segment++; start = i + 1; }
     }
-    return { cards: history, types: types };
+    return { cards: history, types: types, affected: affected };
   }
 
   /** 只从已出牌换入；换出的每张牌都由调用方显式选择。失败不生成部分方案。 */
@@ -354,7 +334,7 @@
     return {
       ok: true, noop: false, view: v, mySeat: seat, gained: want.slice(), given: give.slice(), keep: [], changes: changes,
       history: history.cards, types: history.types, originalTypes: (raw.playedTypeList || []).slice(),
-      notes: ['仅交换已出牌与我的手牌；对应历史牌面会替换为换出牌，其他人的在手牌保持不变。'],
+      notes: ['仅交换已出牌与我的手牌；其他人的在手牌保持不变。', '直接交换将替换第 ' + history.affected.join('、') + ' 个历史动作中的牌面；不再检查原牌型或压牌关系。', '可能影响当前待压牌、记牌器、AI 与回放；数量与归属审计不代表历史仍合法。'],
       stats: { swapGain: want.length }, summary: '换入 ' + cardTexts(want).join(' ') + '；换出 ' + cardTexts(give).join(' ')
     };
   }
@@ -425,6 +405,43 @@
       seen.add(id);
     });
     return { ok: !problems.length, problems: problems, touched: touched, countsSame: countsSame, poolTaken: 0 };
+  }
+
+  /** 下局初始手牌调整：只接受尚无动作、各家仍为初始张数的发牌状态。 */
+  function planDeal(raw, want, opts) {
+    const o = opts || {}, v = expand(raw, o), seat = Number(o.mySeat);
+    if (!Number.isInteger(seat) || seat < 1 || seat > v.seats) return fail(v, '请先入座');
+    if (!validIds(want, v.total) || !want.length || want.length > v.handSize) return fail(v, '下局选牌需为1至' + v.handSize + '张不重复物理牌');
+    if (v.cplLength !== v.total || (raw.playedCardList || []).length || v.isFinish || (v.kind === 'gd' && v.phase !== 'play') ||
+        Object.keys(v.counts).some(function (s) { return v.counts[s] !== v.handSize; })) return fail(v, '只在新一局初始发牌完成、尚无人行动时应用');
+    const after = {};
+    Object.keys(raw).forEach(function (k) { after[k] = Array.isArray(raw[k]) ? raw[k].slice() : raw[k]; });
+    const wanted = new Set(want);
+    const donors = v.hands[seat].filter(function (id) { return !wanted.has(id); });
+    const gained = want.filter(function (id) { return v.owners[id] !== seat; });
+    gained.forEach(function (id, i) {
+      const donor = donors[i], value = after.cardPositionList[id - 1];
+      after.cardPositionList[id - 1] = after.cardPositionList[donor - 1];
+      after.cardPositionList[donor - 1] = value;
+    });
+    return { ok: true, noop: !gained.length, view: v, after: after, cards: want.slice(), gained: gained, given: donors.slice(0, gained.length) };
+  }
+
+  function auditDeal(before, after, opts) {
+    const o = opts || {}, p = planDeal(before, o.cards, o), problems = [];
+    if (!p.ok) problems.push(p.error);
+    const a = expand(before, o), b = expand(after, o), wanted = new Set(o.cards || []);
+    if (a.cplLength !== b.cplLength || b.cplLength !== a.total) problems.push('发牌长度变化');
+    if (JSON.stringify(before.cardPositionList.slice().sort(function (x,y) { return x-y; })) !== JSON.stringify(after.cardPositionList.slice().sort(function (x,y) { return x-y; }))) problems.push('各座位/暗池/底牌标记张数变化');
+    (o.cards || []).forEach(function (id) { if (b.owners[id] !== Number(o.mySeat)) problems.push('所选牌未进入本人手牌'); });
+    for (let i = 0; i < a.total; i++) {
+      if (before.cardPositionList[i] === after.cardPositionList[i]) continue;
+      if (!(wanted.has(i+1) && b.owners[i+1] === Number(o.mySeat)) && !(a.owners[i+1] === Number(o.mySeat) && !wanted.has(i+1))) problems.push('存在与下局选择无关的他人改牌');
+    }
+    Object.keys(PROTO_FIELDS).forEach(function (k) {
+      if (k !== 'cardPositionList' && JSON.stringify(before[k]) !== JSON.stringify(after[k])) problems.push('发牌以外字段被改动：' + k);
+    });
+    return { ok: !problems.length, problems: problems };
   }
 
   /** 优先完整炸弹，再同花顺；组之间不重复占用同一物理牌。 */
@@ -736,6 +753,8 @@
     playedPool: playedPool,
     handGroups: handGroups,
     plan: plan,
+    planDeal: planDeal,
+    auditDeal: auditDeal,
     applyPlan: applyPlan,
     revertPlan: revertPlan,
     audit: audit,

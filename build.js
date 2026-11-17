@@ -12,7 +12,7 @@ const OUT_NAME = 'hullqin-deck-forge.user.js';
 const META = {
   name: '控牌助手（斗地主 / 掼蛋）',
   namespace: 'hullqin-deck-forge',
-  version: '2.2.0',
+  version: '2.3.0',
   author: 'Eve',
   license: 'MIT',
   match: 'https://game.hullqin.cn/*',
@@ -21,7 +21,7 @@ const META = {
   updateURL: 'https://raw.githubusercontent.com/qiaoda2021/hullqin-deck-forge/main/dist/hullqin-deck-forge.user.js',
   description:
     '斗地主 / 掼蛋 一体化牌局助手：👁 叠牌透视（炸弹 / 同花顺高亮） · 🃏 记牌器 · 🤖 AI 建议与托管 · ' +
-    '🔁 仅从已出牌交换，手选换出手牌，其他人的在手牌保持不变。仅供朋友间娱乐。'
+    '🔁 已出牌直接交换（不按历史牌型拦截） · 下一把自选初始手牌（一次性）。仅供朋友间娱乐。'
 };
 
 // 顺序即依赖顺序：后面的模块可以直接用前面挂到 window 的全局

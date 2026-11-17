@@ -97,6 +97,54 @@
     let dealPlan = [];        // 开局预设：每局发牌瞬间要变成的牌
     let dealAuto = false;
     let dealDelay = 260;
+    let nextDeals = {};
+    const nextKey = function (ctx) { return ctx.kind + ':' + ctx.seats; };
+    function saveNextDeals() {
+      try { if (!win || !win.localStorage) return false; win.localStorage.setItem('dg.nextDeal.v1', JSON.stringify(nextDeals)); return true; } catch (e) { toast('下局预设保存失败，本次不会自动改发牌'); return false; }
+    }
+    function nextInfo(ctx) { return nextDeals[nextKey(ctx)] || { cards: [], armed: false, status: '未设置下一把' }; }
+    function armNextDeal(cards) {
+      const ctx = read();
+      if (!ctx || !ctx.mySeat || !Array.isArray(cards) || !cards.length || cards.length > ctx.view.handSize ||
+          new Set(cards).size !== cards.length || cards.some(function (id) { return !Number.isInteger(id) || id < 1 || id > ctx.view.total; })) {
+        toast('请在牌桌中选择1至当前初始手牌张数的不重复物理牌'); return false;
+      }
+      const previous = nextDeals[nextKey(ctx)];
+      nextDeals[nextKey(ctx)] = { cards: cards.slice(), armed: true, waiting: !ctx.view.isFinish && !ctx.view.played.length, seat: ctx.mySeat, status: '已设置，等待下一局新发牌（仅一次）' };
+      if (!saveNextDeals()) {
+        if (previous) nextDeals[nextKey(ctx)] = previous; else delete nextDeals[nextKey(ctx)];
+        lastSig = ''; tick(); return false;
+      }
+      lastSig = ''; tick(); return true;
+    }
+    function cancelNextDeal() {
+      const ctx = read(); if (!ctx) return;
+      const entry = nextInfo(ctx); entry.armed = false; entry.status = '已取消下一把预设';
+      nextDeals[nextKey(ctx)] = entry;
+      if (!saveNextDeals()) entry.status = '本页已取消，但保存失败；刷新后请再次核对预设';
+      lastSig = ''; tick();
+    }
+    function applyNextDeal(ctx) {
+      const entry = nextInfo(ctx);
+      if (!entry.armed) return false;
+      if (entry.seat !== ctx.mySeat) { entry.armed = false; entry.status = '座位已变化，预设已取消'; saveNextDeals(); return false; }
+      const fresh = newRoundOf(ctx);
+      if (entry.waiting && (ctx.view.isFinish || ctx.view.played.length)) { entry.waiting = false; saveNextDeals(); }
+      if (entry.waiting || !fresh || busy || (ctx.kind === 'gd' && ctx.view.phase !== 'play')) return false;
+      const p = DG.planDeal(ctx.raw, entry.cards, { mySeat: ctx.mySeat, seats: ctx.seats });
+      entry.armed = false; // 一次性消费先落盘：刷新/失败也不会偷偷改下一局。
+      if (!p.ok) { entry.status = p.error; saveNextDeals(); return false; }
+      const check = DG.auditDeal(ctx.raw, p.after, { cards: entry.cards, mySeat: ctx.mySeat, seats: ctx.seats });
+      if (!check.ok) { entry.status = check.problems.join('；'); saveNextDeals(); return false; }
+      entry.status = p.noop ? '原发牌已满足预设，已完成（一次）' : '已触发，正在等待下局预设广播确认';
+      if (!saveNextDeals()) { entry.status = '消费状态保存失败，未发送下局预设；请重新设置'; return false; }
+      if (p.noop) return false;
+      transmit(ctx, p.after, function (ok) {
+        entry.status = ok ? '下一把预设已生效（一次），不会继续改后续发牌' : '下一把预设未确认，已停止；未覆盖新状态';
+        saveNextDeals(); toast(entry.status); lastSig = ''; tick();
+      });
+      return true;
+    }
     let aiAuto = false;       // AI 托管
     let aiPlayedSig = '';     // 托管已出手的回合签名
     let aiCache = { sig: '', v: null };
@@ -167,6 +215,7 @@
         canDeal: !!(ctx.props.room && ctx.props.room.state === 0),
         ai: aiInfo(ctx),
         rec: recInfo(ctx),
+        nextDeal: nextInfo(ctx),
         hint: ''
       };
     }
@@ -202,7 +251,7 @@
     function suggestOf(ctx) {
       if (!DGAI || typeof DGAI.suggest !== 'function') return null;
       const sig = [ctx.kind, ctx.raw.state, ctx.raw.playedCardList.length, ctx.view.currentPlayer,
-        ctx.mySeat, (ctx.props.game && ctx.props.game.version) || 0].join('|');
+        ctx.mySeat, ctx.view.level, (ctx.props.game && ctx.props.game.version) || 0].join('|');
       if (aiCache.sig === sig) return aiCache.v;
       let r = null;
       try {
@@ -259,11 +308,11 @@
       }
       const v = ctx.view;
       lastVer = Number(ctx.props.game && ctx.props.game.version) || 0;
-      // 仅从已出牌交换：开局预设停用，不再自动改发牌。
+      if (applyNextDeal(ctx)) return;
       const sig = [v.state, v.played.length, v.counts[1], v.counts[2], v.counts[3], v.counts[4] || 0,
-        lastVer, ctx.kind, ctx.mySeat].join('|');
+        lastVer, ctx.kind, ctx.mySeat, v.level].join('|');
       // AI 托管：轮到我且还没为这一版出过手
-      if (aiAuto && v.phase === 'play' && v.currentPlayer === ctx.mySeat) {
+      if (!busy && aiAuto && v.phase === 'play' && v.currentPlayer === ctx.mySeat) {
         const s = suggestOf(ctx);
         const pk = sig + '|ai';
         if (s && s.cards && s.cards.length && aiPlayedSig !== pk) {
@@ -307,29 +356,26 @@
       if (ui) ui.renderAudit(chk);
       if (!chk.ok) { toast('自检没通过，已中止：' + chk.problems[0]); return; }
 
-      snapshotVersion = Number(ctx.props.game.version) || 0;
-      snapshot = ctx.raw;
-      snapshotAfter = forged;
-      snapshotAt = Date.now();
-      busy = true;
-      if (ui) ui.setBusy(true);
-
-      let sent = 0;
-      try { sent = sendUpdate(forged); } catch (e) { busy = false; if (ui) ui.setBusy(false); toast('发送失败：' + e.message); return; }
-
       const want = plan.gained.slice();
-      verifyThen(forged, 0, function (ok) {
-        busy = false;
-        if (ui) ui.setBusy(false);
-        if (!ok) {
-          toast('服务器未确认此次交换；保留当前牌局，请刷新重选');
-          // 广播已前进时不把旧局面覆盖回去。
-          snapshot = null; snapshotAfter = null;
-          return;
-        }
+      transmit(ctx, forged, function (ok, sent) {
+        if (!ok) { toast('服务器未确认此次交换；保留当前牌局，请刷新重选'); return; }
         toast('换牌成功：' + want.map(DG.cardText).join(' ') + '（' + sent + ' 字节）');
         if (alsoPlay) playCards(want);
       });
+    }
+
+    function transmit(ctx, target, done) {
+      snapshotVersion = Number(ctx.props.game.version) || 0;
+      snapshot = ctx.raw; snapshotAfter = target; snapshotAt = Date.now(); busy = true;
+      if (ui) ui.setBusy(true);
+      let sent = 0;
+      function finish(ok) {
+        busy = false; if (ui) ui.setBusy(false);
+        if (!ok) { snapshot = null; snapshotAfter = null; }
+        done(ok, sent);
+      }
+      try { sent = sendUpdate(target); } catch (e) { finish(false); return; }
+      verifyThen(target, 0, finish);
     }
 
     /** 轮询确认服务器是否已把我的改动广播回来 */
@@ -410,6 +456,10 @@
       if (ui) return ui;
       loadDeal();
       try {
+        const saved = JSON.parse(win && win.localStorage.getItem('dg.nextDeal.v1') || '{}');
+        if (saved && typeof saved === 'object' && !Array.isArray(saved)) nextDeals = saved;
+      } catch (e) { nextDeals = {}; }
+      try {
         if (win && win.localStorage.getItem('dg.aiauto') === '1') aiAuto = true;
       } catch (e) { /* ignore */ }
       ui = DGUi.create(doc.body, {
@@ -419,6 +469,8 @@
           else if (name === 'forge-play') forge(ui.getSelected(), true);
           else if (name === 'revert') revert();
           else if (name === 'clear') ui.renderPlan(null);
+          else if (name === 'next-arm') armNextDeal(payload);
+          else if (name === 'next-cancel') cancelNextDeal();
           else if (name === 'refresh') { lastSig = ''; aiCache = { sig: '', v: null }; tick(); }
           else if (name === 'preset') { /* 选择已在 UI 内完成 */ }
           else if (name === 'toast') { toast(String(payload || '')); }
@@ -501,6 +553,9 @@
         const ctx = read();
         return ctx ? recInfo(ctx) : null;
       },
+      armNextDeal: armNextDeal,
+      cancelNextDeal: cancelNextDeal,
+      getNextDeal: function () { const ctx = read(); return ctx ? JSON.parse(JSON.stringify(nextInfo(ctx))) : null; },
       getDeal: function () { return { cards: dealPlan.slice(), auto: dealAuto, delay: dealDelay }; },
       setDeal: function (d) {
         d = d || {};
